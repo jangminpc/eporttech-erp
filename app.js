@@ -22,7 +22,53 @@ const IDB = {
   async set(k, v) { const db = await this.open(); return new Promise(ok => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = () => ok(); }); }
 };
 function blankDB() { return { version: 1, settings: { company: '이포트텍', bizNo: '599-01-01772', arStart: '2026-09-01', syncUrl: '', syncToken: '', owner: '', tel: '', email: '', address: '' }, sites: [], invoices: [], events: [], parts: [], deposits: [], manualPaid: {}, orders: [], changes: [], mailSeen: [], quotes: [] }; }
-async function save() { DB.updated = new Date().toISOString(); await IDB.set('db', DB); invalidate(); }
+async function save() { DB.updated = new Date().toISOString(); await IDB.set('db', DB); invalidate(); schedulePush(); }
+async function persist() { await IDB.set('db', DB); invalidate(); } // 동기화 표시만 바꿀 때 (변경으로 치지 않음)
+
+/* ---------------- 자동 동기화: 고치면 몇 초 뒤 시트로 올리고, 앱을 열거나 다시 보면 시트의 새 자료를 받음 ---------------- */
+const syncReady = () => !!(DB && DB.settings.syncUrl && DB.settings.syncToken);
+const isDirty = () => (DB.updated || '') > (DB.settings.lastSync || '');
+let _pushT = null, _pushing = false, _pulling = false;
+function schedulePush() { if (!syncReady()) return; clearTimeout(_pushT); _pushT = setTimeout(autoPush, 3000); }
+async function pushNow() {
+  const s = DB.settings, u = DB.updated; const { syncUrl, syncToken, lastSync, ...rest } = s;
+  const r = await fetch(s.syncUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: syncToken, data: { ...DB, settings: rest } }) });
+  const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
+  s.lastSync = u; await persist(); syncBadge();
+}
+async function autoPush() {
+  if (!syncReady() || !isDirty() || !navigator.onLine) { syncBadge(); return; }
+  if (_pushing) { schedulePush(); return; }
+  _pushing = true; syncBadge('올리는 중');
+  try { await pushNow(); } catch (e) { syncBadge('동기화 실패'); setTimeout(autoPush, 30000); } finally { _pushing = false; }
+}
+async function autoPull() {
+  if (!syncReady() || !navigator.onLine || _pulling || _pushing) return;
+  const first = !DB.settings.lastSync; // 이 기기를 처음 연결했으면 시트 자료가 기준
+  if (isDirty() && !first) { await autoPush(); return; } // 이 기기에서 고친 게 먼저
+  _pulling = true; syncBadge('확인 중');
+  try {
+    const s = DB.settings; const r = await fetch(s.syncUrl + (s.syncUrl.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(s.syncToken)); const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
+    const d = j.data;
+    if (d && (first || ((d.updated || '') > (DB.updated || '') && !isDirty()))) {
+      const keep = { syncUrl: s.syncUrl, syncToken: s.syncToken, lastSync: d.updated };
+      DB = Object.assign(blankDB(), d); DB.settings = Object.assign(blankDB().settings, d.settings, keep); await persist();
+      const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+      if (!typing && document.getElementById('modal').classList.contains('hidden')) render(); toast('다른 기기에서 바꾼 내용을 받았습니다');
+    } else if (!d) { if (!DB.updated) DB.updated = new Date().toISOString(); DB.settings.lastSync = ''; await autoPush(); }
+    syncBadge();
+  } catch (e) { syncBadge('동기화 실패'); } finally { _pulling = false; }
+  await pullInbox(true);
+}
+function syncBadge(msg) {
+  const b = document.getElementById('syncBadge'); if (!b) return;
+  if (!syncReady()) { b.textContent = ''; return; }
+  b.textContent = msg || (!navigator.onLine ? '오프라인' : isDirty() ? '올릴 내용 있음' : '동기화됨');
+  b.className = 'sync-badge' + (msg === '동기화 실패' ? ' bad' : '');
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') autoPull(); else if (isDirty()) autoPush(); });
+window.addEventListener('online', () => autoPull());
+setInterval(() => { if (document.visibilityState === 'visible') autoPull(); }, 60000);
 let _cache = null; const invalidate = () => { _cache = null; };
 
 /* ---------------- 계산 ---------------- */
@@ -526,7 +572,9 @@ function viewSettings() {
   <div class="card"><h3>백업</h3><div class="btns"><button class="btn ghost" onclick="exportJSON()">백업 파일 저장</button><button class="btn ghost" onclick="importJSON()">백업·초기 데이터 불러오기</button><button class="btn red" onclick="resetAll()">전체 초기화</button></div>
   <div class="note">사이트 ${DB.sites.length} · 계산서 ${DB.invoices.length} · 작업기록 ${DB.events.length} · 부품 ${DB.parts.length} · 입금 ${DB.deposits.length}</div></div>`;
 }
-async function saveSettings() { const s = DB.settings; s.company = $('#stCompany').value.trim(); s.bizNo = $('#stBiz').value.trim(); s.arStart = $('#stAr').value || '2000-01-01'; s.syncUrl = $('#stUrl').value.trim(); s.owner = $('#stOwner').value.trim(); s.tel = $('#stTel').value.trim(); s.email = $('#stEmail').value.trim(); s.address = $('#stAddr').value.trim(); s.syncToken = $('#stTok').value; await save(); toast('저장했습니다'); render(); }
+async function saveSettings() { const s = DB.settings, wasReady = syncReady(); s.company = $('#stCompany').value.trim(); s.bizNo = $('#stBiz').value.trim(); s.arStart = $('#stAr').value || '2000-01-01'; s.syncUrl = $('#stUrl').value.trim(); s.owner = $('#stOwner').value.trim(); s.tel = $('#stTel').value.trim(); s.email = $('#stEmail').value.trim(); s.address = $('#stAddr').value.trim(); s.syncToken = $('#stTok').value;
+  if (!wasReady && syncReady()) { s.lastSync = ''; await persist(); toast('저장했습니다. 시트와 맞추는 중…'); render(); autoPull(); return; }
+  await save(); toast('저장했습니다'); render(); }
 function exportJSON() { download(`이포트텍_ERP_백업_${todayStr()}.json`, JSON.stringify(DB)); }
 async function importJSON() {
   const f = await pickFile('.json'); if (!f) return;
@@ -538,17 +586,15 @@ async function importJSON() {
 async function resetAll() { if (!confirm('모든 자료를 지울까요? (먼저 백업을 저장하세요)')) return; const st = DB.settings; DB = blankDB(); DB.settings.syncUrl = st.syncUrl; DB.settings.syncToken = st.syncToken; await save(); render(); }
 async function syncPush() {
   const s = DB.settings; if (!s.syncUrl) { toast('웹앱 주소를 먼저 저장하세요'); return; }
-  try { toast('올리는 중…'); s.lastSync = new Date().toISOString(); const { syncUrl, syncToken, ...rest } = s; const body = JSON.stringify({ token: syncToken, data: { ...DB, settings: rest } });
-    const r = await fetch(s.syncUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body }); const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
-    await save(); toast('구글 시트에 저장했습니다'); render(); } catch (e) { alert('동기화 실패: ' + e.message); }
+  try { toast('올리는 중…'); if (!DB.updated) DB.updated = new Date().toISOString(); await pushNow(); toast('구글 시트에 저장했습니다'); render(); } catch (e) { alert('동기화 실패: ' + e.message); }
 }
 async function syncPull() {
   const s = DB.settings; if (!s.syncUrl) { toast('웹앱 주소를 먼저 저장하세요'); return; }
   try { toast('받는 중…'); const r = await fetch(s.syncUrl + (s.syncUrl.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(s.syncToken)); const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
     if (!j.data) { toast('시트에 저장된 자료가 없습니다'); return; }
     if (!confirm(`시트 자료(${j.data.updated ? new Date(j.data.updated).toLocaleString('ko-KR') : ''})로 이 기기 자료를 바꿀까요?`)) return;
-    const keep = { syncUrl: s.syncUrl, syncToken: s.syncToken }; DB = Object.assign(blankDB(), j.data); DB.settings = Object.assign(blankDB().settings, j.data.settings, keep, { lastSync: new Date().toISOString() });
-    await save(); toast('받았습니다'); render(); await pullInbox(true); } catch (e) { alert('동기화 실패: ' + e.message); }
+    const keep = { syncUrl: s.syncUrl, syncToken: s.syncToken }; DB = Object.assign(blankDB(), j.data); if (!DB.updated) DB.updated = new Date().toISOString(); DB.settings = Object.assign(blankDB().settings, j.data.settings, keep, { lastSync: DB.updated });
+    await persist(); syncBadge(); toast('받았습니다'); render(); await pullInbox(true); } catch (e) { alert('동기화 실패: ' + e.message); }
 }
 
 /* ---------------- 발주·요청 (메일 자동 입력) ---------------- */
@@ -633,7 +679,7 @@ async function pullInbox(silent) {
   const s = DB.settings; if (!s.syncUrl) { if (!silent) toast('⚙설정에서 구글 시트를 먼저 연결하세요'); return; }
   try {
     const r = await fetch(s.syncUrl + (s.syncUrl.includes('?') ? '&' : '?') + 'inbox=1&token=' + encodeURIComponent(s.syncToken)); const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
-    const items = j.items || []; const res = applyInboxItems(items); s.lastInbox = new Date().toISOString(); await save();
+    const items = j.items || []; const res = applyInboxItems(items); s.lastInbox = new Date().toISOString(); if (items.length) await save(); else await persist();
     if (items.length) await fetch(s.syncUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: s.syncToken, action: 'ack', ids: items.map(x => x.mailId || x.id) }) });
     render(); if (!silent || res.o || res.c || res.ev) toast(`메일에서 발주·요청 ${res.o}건, 유지보수 변경 ${res.c}건, 점검완료 ${res.ev}건을 받았습니다`);
   } catch (e) { if (!silent) alert('메일 업무 받기 실패: ' + e.message); }
@@ -773,7 +819,7 @@ $('#btnSettings').onclick = () => go('#settings');
 (async () => {
   DB = (await IDB.get('db')) || blankDB();
   DB = Object.assign(blankDB(), DB); DB.settings = Object.assign(blankDB().settings, DB.settings);
-  render();
-  if (DB.settings.syncUrl) pullInbox(true);
+  render(); syncBadge();
+  if (syncReady()) autoPull(); else if (DB.settings.syncUrl) pullInbox(true);
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
