@@ -74,3 +74,8 @@ label.f>input,label.f>select,label.f>textarea{margin-top:4px;color:var(--txt)}
 
 .sync-badge{margin-left:auto;margin-right:6px;font-size:12px;opacity:.85}
 .sync-badge.bad{color:#ffb4b4;opacity:1}
+.pcbars{display:flex;gap:4px;align-items:flex-end;height:120px;margin-top:8px}
+.pcbars a{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;cursor:pointer;color:var(--sub);font-size:11px;text-decoration:none}
+.pcbars a i{display:block;width:70%;background:#9fb6d0;border-radius:3px 3px 0 0;min-height:2px}
+.pcbars a.on i{background:var(--pri)}.pcbars a.on span{color:var(--txt);font-weight:700}
+.pcbars a small{font-size:10px;height:12px}

@@ -335,8 +335,9 @@ function siteForm(s) {
 let invYM = null, invTab = 'month', invQ = '', invKind = '매출';
 function viewInvoices(sub) {
   if (sub) invTab = sub;
-  const seg = `<div class="seg"><a href="#invoices/month" class="${invTab === 'month' ? 'on' : ''}">월별 발행 점검</a><a href="#invoices/list" class="${invTab === 'list' ? 'on' : ''}">전체 목록</a><a href="#invoices/forecast" class="${invTab === 'forecast' ? 'on' : ''}">매출 예상</a></div>`;
+  const seg = `<div class="seg"><a href="#invoices/month" class="${invTab === 'month' ? 'on' : ''}">월별 발행 점검</a><a href="#invoices/list" class="${invTab === 'list' ? 'on' : ''}">전체 목록</a><a href="#invoices/percall" class="${invTab === 'percall' ? 'on' : ''}">퍼콜·장애</a><a href="#invoices/forecast" class="${invTab === 'forecast' ? 'on' : ''}">매출 예상</a></div>`;
   if (invTab === 'list') return seg + invList();
+  if (invTab === 'percall') return seg + perCallView();
   if (invTab === 'forecast') return seg + forecast();
   const ym = invYM || ymOf(todayStr()); const st = billingStatus(ym);
   const exp = st.reduce((a, x) => a + x.site.amount, 0), got = st.reduce((a, x) => a + Math.max(0, x.net), 0);
@@ -352,6 +353,34 @@ function viewInvoices(sub) {
   ${extra.map(i => row(esc(i.name), `${i.date} · ${esc(i.item)}`, won(i.supply), `onclick="invDetail('${i.id}')"`)).join('') || '<div class="empty">없음</div>'}</div>
   <div class="btns"><button class="btn" onclick="importHometax()">홈택스 파일 올리기</button></div>
   <div class="note">홈택스 ‘매출/매입 전자세금계산서 목록조회’에서 받은 엑셀(.xls/.xlsx) 또는 CSV를 올리면 새 계산서만 추가되고, 사업자번호와 품목명으로 사이트에 자동 연결됩니다. 품목명에 “10월” 같은 표시가 있으면 그 달 몫으로 봅니다.</div>`;
+}
+/* ---------------- 퍼콜·장애처리 (유지보수 외 작업) 월별 ---------------- */
+const PC_CATS = [['장애처리', /장애|출동|복구|고장|에러|오류|긴급|디스크 ?교체|부품 ?교체|교체/], ['설치·이전', /설치|이전|이설|구축|마이그|납품|공급|증설/], ['기술지원', /지원|점검|컨설팅|작업|패치|업그레이드/]];
+const pcCat = t => (PC_CATS.find(([, re]) => re.test(t || '')) || ['기타'])[0];
+const PC_COLOR = { '장애처리': 'red', '설치·이전': '', '기술지원': 'grn', '기타': '' };
+function perCallInvoices() { const c = calc(); return DB.invoices.filter(i => i.kind === '매출' && !c.siteOf[i.id] && !c.cancelled.has(i.id) && i.supply > 0); }
+let pcYM = null, pcCatF = '전체';
+function perCallView() {
+  const ym = pcYM || ymOf(todayStr()), year = ym.slice(0, 4);
+  const all = perCallInvoices(), okCat = t => pcCatF === '전체' || pcCat(t) === pcCatF;
+  const months = Array.from({ length: 12 }, (_, k) => `${year}-${String(k + 1).padStart(2, '0')}`);
+  const byM = Object.fromEntries(months.map(m => [m, all.filter(i => ymOf(i.date) === m && okCat(i.item))]));
+  const yearSum = months.reduce((a, m) => a + byM[m].reduce((b, i) => b + i.supply, 0), 0), yearCnt = months.reduce((a, m) => a + byM[m].length, 0);
+  const max = Math.max(1, ...months.map(m => byM[m].reduce((b, i) => b + i.supply, 0)));
+  const invs = byM[ym] || all.filter(i => ymOf(i.date) === ym && okCat(i.item));
+  const evs = DB.events.filter(e => ymOf(e.date) === ym && !INSPECT_TYPES.includes(e.type) && okCat(e.type + ' ' + (e.title || ''))).sort((a, b) => a.date.localeCompare(b.date));
+  const ods = (DB.orders || []).filter(o => ymOf(o.date) === ym && ['발주', '장애·점검요청'].includes(o.kind) && !['계산서발행', '취소'].includes(o.status) && okCat(o.title));
+  const siteName = id => (DB.sites.find(x => x.id === id) || {}).name || '';
+  const catSum = PC_CATS.map(([k]) => k).concat('기타').map(k => [k, invs.filter(i => pcCat(i.item) === k)]).filter(([, l]) => l.length);
+  return `<div class="toolbar"><select onchange="pcCatF=this.value;render()">${['전체', '장애처리', '설치·이전', '기술지원', '기타'].map(k => `<option ${k === pcCatF ? 'selected' : ''}>${k}</option>`).join('')}</select></div>
+  <div class="card"><h3>${year}년 유지보수 외 매출 ${yearCnt}건 <span class="sub" style="font-size:12px;font-weight:400">${won(yearSum)}원</span></h3>
+  <div class="pcbars">${months.map(m => { const v = byM[m].reduce((b, i) => b + i.supply, 0); return `<a class="${m === ym ? 'on' : ''}" onclick="pcYM='${m}';render()"><i style="height:${Math.round(v / max * 100)}%"></i><span>${Number(m.slice(5))}월</span><small>${byM[m].length || ''}</small></a>`; }).join('')}</div></div>
+  <div class="monthnav"><button onclick="pcYM='${ymAdd(ym, -1)}';render()">◀</button>${ymLabel(ym)}<button onclick="pcYM='${ymAdd(ym, 1)}';render()">▶</button></div>
+  <div class="card"><h3>계산서 ${invs.length}건 <span class="sub" style="font-size:12px;font-weight:400">${won(invs.reduce((a, i) => a + i.supply, 0))}원${catSum.length > 1 ? ' · ' + catSum.map(([k, l]) => `${k} ${l.length}`).join(' · ') : ''}</span></h3>
+  ${invs.sort((a, b) => a.date.localeCompare(b.date)).map(i => { const k = pcCat(i.item); return row(`${esc(i.item)} <span class="badge ${PC_COLOR[k]}">${k}</span>`, `${i.date.slice(5)} · ${esc(i.name)}`, won(i.supply), `onclick="invDetail('${i.id}')"`); }).join('') || '<div class="empty">없음</div>'}</div>
+  ${evs.length ? `<div class="card"><h3>작업 기록 ${evs.length}건</h3>${evs.map(e => row(`${esc(e.title || e.type)} <span class="badge ${PC_COLOR[pcCat(e.type)] || ''}">${esc(e.type)}</span>`, `${e.date.slice(5)} · ${esc(siteName(e.siteId))}`, '', `onclick="go('#site/${e.siteId}')"`)).join('')}</div>` : ''}
+  ${ods.length ? `<div class="card"><h3>계산서 전 (발주·요청) ${ods.length}건</h3>${ods.map(o => row(`${esc(o.title)} <span class="badge org">${esc(o.status)}</span>`, `${o.date.slice(5)} · ${esc(o.client || o.customer || '')}`, o.amount ? won(o.amount) : '', `onclick="go('#orders')"`)).join('')}</div>` : ''}
+  <div class="note">유지보수 사이트에 연결되지 않은 매출 계산서를 퍼콜·장애 작업으로 봅니다. 종류는 품목명 단어(장애·출동·교체 → 장애처리, 설치·이전·납품 → 설치·이전, 지원·작업 → 기술지원)로 나눕니다. 계산서를 눌러 사이트에 연결하면 유지보수로 옮겨 갑니다.</div>`;
 }
 function invList() {
   const q = invQ.toLowerCase(); const c = calc();
