@@ -120,10 +120,14 @@ function billingStatus(ym) {
   });
 }
 function inspectStatus(ym) {
+  const c = calc();
   return DB.sites.filter(s => inspectExpected(s, ym)).map(s => {
     const ev = DB.events.filter(e => e.siteId === s.id && ymOf(e.date) === ym && INSPECT_TYPES.includes(e.type)).sort((a, b) => a.date.localeCompare(b.date));
     const plan = ym + '-' + String(Math.min(s.visitDay || 25, 28)).padStart(2, '0');
-    return { site: s, ev, done: ev.length > 0, plan, late: !ev.length && todayStr() > plan };
+    // 점검 기록이 없어도 그 달 서비스분 계산서가 나갔으면 점검한 것으로 봄
+    const byInv = !ev.length && (c.bySite[s.id] || []).some(i => c.period[i.id] === ym && i.supply > 0 && !c.cancelled.has(i.id));
+    const done = ev.length > 0 || byInv;
+    return { site: s, ev, done, byInv, plan, late: !done && todayStr() > plan };
   }).sort((a, b) => a.done - b.done || a.plan.localeCompare(b.plan));
 }
 function receivables() {
@@ -179,7 +183,7 @@ function viewHome() {
   for (let k = 1; ymAdd(ym, k).startsWith(y); k++) rest += expectedOfMonth(ymAdd(ym, k));
   return `
   <div class="grid4">
-    <div class="stat" onclick="go('#schedule')"><div class="k">${Number(ym.slice(5))}월 점검</div><div class="v ${insDone < ins.length ? 'org' : 'grn'}">${insDone}/${ins.length}</div><div class="s">미점검 ${ins.length - insDone}곳</div></div>
+    <div class="stat" onclick="go('#schedule')"><div class="k">${Number(ym.slice(5))}월 점검</div><div class="v ${insDone < ins.length ? 'org' : 'grn'}">${insDone}/${ins.length}</div><div class="s">${ins.filter(x => x.late).length ? '미점검 ' + ins.filter(x => x.late).length + '곳' : '남은 점검 ' + (ins.length - insDone) + '곳'}</div></div>
     <div class="stat" onclick="go('#invoices')"><div class="k">${Number(ym.slice(5))}월 계산서</div><div class="v ${billLeft.length ? 'org' : 'grn'}">${billDone.length}/${bill.length}</div><div class="s">미발행 ${man(billLeft.reduce((a, x) => a + x.site.amount, 0))}원</div></div>
     <div class="stat" onclick="go('#ar')"><div class="k">미수금</div><div class="v ${ar.length ? 'red' : 'grn'}">${man(arSum)}</div><div class="s">${ar.length}건 (부가세 포함)</div></div>
     <div class="stat" onclick="go('#parts')"><div class="k">재고 부족</div><div class="v ${low.length ? 'red' : ''}">${low.length}</div><div class="s">품목 ${DB.parts.length}개</div></div>
@@ -212,7 +216,7 @@ function viewSchedule() {
   <div class="monthnav"><button onclick="schedYM='${ymAdd(ym, -1)}';render()">◀</button>${ymLabel(ym)}<button onclick="schedYM='${ymAdd(ym, 1)}';render()">▶</button></div>
   <div class="card"><h3>정기점검 ${done}/${ins.length} <span class="sub" style="font-size:12px;font-weight:400">${Math.round(done / (ins.length || 1) * 100)}%</span></h3>
     <div class="bar"><i style="width:${done / (ins.length || 1) * 100}%"></i></div>
-    ${ins.map(x => row(`${esc(x.site.name)} ${x.done ? '<span class="badge grn">완료</span>' : x.late ? '<span class="badge red">미점검</span>' : '<span class="badge">예정</span>'}`,
+    ${ins.map(x => row(`${esc(x.site.name)} ${x.done ? (x.byInv ? '<span class="badge grn">완료(계산서)</span>' : '<span class="badge grn">완료</span>') : x.late ? '<span class="badge red">미점검</span>' : '<span class="badge">예정</span>'}`,
       x.done ? `${x.ev.map(e => e.date.slice(5) + ' ' + esc(e.type)).join(', ')}` : `예정일 ${x.plan.slice(5)} · ${esc(x.site.inspect || '방문')} · ${esc(x.site.client)}`,
       x.done ? '' : `<button class="btn sm grn" onclick="event.stopPropagation();eventForm({siteId:'${x.site.id}',date:'${ym === ymOf(todayStr()) ? todayStr() : x.plan}',type:'${x.site.inspect === '원격' ? '원격점검' : '정기점검'}',title:'${Number(ym.slice(5))}월 정기점검'})">완료</button> <a class="btn sm ghost" target="_blank" onclick="event.stopPropagation()" href="${gcalUrl(x.site, x.plan)}">캘린더</a>`,
       `onclick="go('#site/${x.site.id}')"`)).join('') || '<div class="empty">점검 대상 사이트가 없습니다</div>'}
