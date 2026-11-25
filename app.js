@@ -109,7 +109,7 @@ function calc() {
   _cache = c; return c;
 }
 const siteActiveIn = (s, ym) => s.active !== false && (!s.startMonth || ym >= s.startMonth);
-const billExpected = (s, ym) => siteActiveIn(s, ym) && (!s.billMonths || !s.billMonths.length || s.billMonths.includes(Number(ym.slice(5))));
+const billExpected = (s, ym) => siteActiveIn(s, ym) && Number(s.amount) > 0 && (!s.billMonths || !s.billMonths.length || s.billMonths.includes(Number(ym.slice(5))));
 const inspectExpected = (s, ym) => siteActiveIn(s, ym) && (!s.inspectMonths || !s.inspectMonths.length || s.inspectMonths.includes(Number(ym.slice(5))));
 function billingStatus(ym) {
   const c = calc();
