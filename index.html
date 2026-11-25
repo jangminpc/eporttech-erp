@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f4e79">
+<title>이포트텍 ERP</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="title" id="pageTitle">이포트텍 ERP</div>
+  <button class="icon-btn" id="btnSettings" aria-label="설정">⚙</button>
+</header>
+<main id="view"></main>
+<nav class="tabs" id="tabs">
+  <a href="#home" data-tab="home"><span>🏠</span>홈</a>
+  <a href="#schedule" data-tab="schedule"><span>📅</span>일정</a>
+  <a href="#sites" data-tab="sites"><span>🏢</span>사이트</a>
+  <a href="#orders" data-tab="orders"><span>📨</span>발주</a>
+  <a href="#invoices" data-tab="invoices"><span>🧾</span>계산서</a>
+  <a href="#ar" data-tab="ar"><span>💰</span>미수금</a>
+  <a href="#parts" data-tab="parts"><span>📦</span>재고</a>
+</nav>
+<div id="modal" class="modal hidden"><div class="sheet" id="sheet"></div></div>
+<div id="toast" class="toast hidden"></div>
+<input type="file" id="filePicker" class="hidden">
+<script src="lib/xlsx.full.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
