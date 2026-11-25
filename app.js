@@ -335,9 +335,9 @@ function siteForm(s) {
 let invYM = null, invTab = 'month', invQ = '', invKind = '매출';
 function viewInvoices(sub) {
   if (sub) invTab = sub;
-  const seg = `<div class="seg"><a href="#invoices/month" class="${invTab === 'month' ? 'on' : ''}">월별 발행 점검</a><a href="#invoices/list" class="${invTab === 'list' ? 'on' : ''}">전체 목록</a><a href="#invoices/percall" class="${invTab === 'percall' ? 'on' : ''}">퍼콜·장애</a><a href="#invoices/forecast" class="${invTab === 'forecast' ? 'on' : ''}">매출 예상</a></div>`;
+  const seg = `<div class="seg"><a href="#invoices/month" class="${invTab === 'month' ? 'on' : ''}">월별 발행 점검</a><a href="#invoices/list" class="${invTab === 'list' ? 'on' : ''}">전체 목록</a><a href="#invoices/pl" class="${invTab === 'pl' ? 'on' : ''}">매출·매입</a><a href="#invoices/forecast" class="${invTab === 'forecast' ? 'on' : ''}">매출 예상</a></div>`;
   if (invTab === 'list') return seg + invList();
-  if (invTab === 'percall') return seg + perCallView();
+  if (invTab === 'pl') return seg + plView();
   if (invTab === 'forecast') return seg + forecast();
   const ym = invYM || ymOf(todayStr()); const st = billingStatus(ym);
   const exp = st.reduce((a, x) => a + x.site.amount, 0), got = st.reduce((a, x) => a + Math.max(0, x.net), 0);
@@ -381,6 +381,33 @@ function perCallView() {
   ${evs.length ? `<div class="card"><h3>작업 기록 ${evs.length}건</h3>${evs.map(e => row(`${esc(e.title || e.type)} <span class="badge ${PC_COLOR[pcCat(e.type)] || ''}">${esc(e.type)}</span>`, `${e.date.slice(5)} · ${esc(siteName(e.siteId))}`, '', `onclick="go('#site/${e.siteId}')"`)).join('')}</div>` : ''}
   ${ods.length ? `<div class="card"><h3>계산서 전 (발주·요청) ${ods.length}건</h3>${ods.map(o => row(`${esc(o.title)} <span class="badge org">${esc(o.status)}</span>`, `${o.date.slice(5)} · ${esc(o.client || o.customer || '')}`, o.amount ? won(o.amount) : '', `onclick="go('#orders')"`)).join('')}</div>` : ''}
   <div class="note">유지보수 사이트에 연결되지 않은 매출 계산서를 퍼콜·장애 작업으로 봅니다. 종류는 품목명 단어(장애·출동·교체 → 장애처리, 설치·이전·납품 → 설치·이전, 지원·작업 → 기술지원)로 나눕니다. 계산서를 눌러 사이트에 연결하면 유지보수로 옮겨 갑니다.</div>`;
+}
+/* ---------------- 매출·매입 기간별 ---------------- */
+let plUnit = '분기', plYear = null, plSel = null;
+const qOf = d => `${d.slice(0, 4)}-Q${Math.ceil(Number(d.slice(5, 7)) / 3)}`;
+function plKey(d) { return plUnit === '연도' ? d.slice(0, 4) : plUnit === '분기' ? qOf(d) : d.slice(0, 7); }
+function plLabel(k) { return plUnit === '연도' ? k + '년' : plUnit === '분기' ? `${k.slice(0, 4)}년 ${k.slice(6)}분기` : ymLabel(k); }
+function plView() {
+  const years = [...new Set(DB.invoices.map(i => i.date.slice(0, 4)))].sort();
+  const yr = plYear || years[years.length - 1] || todayStr().slice(0, 4);
+  const inv = DB.invoices.filter(i => plUnit === '연도' || yr === '전체' || i.date.startsWith(yr));
+  const g = {}; for (const i of inv) { const k = plKey(i.date); const x = g[k] = g[k] || { s: 0, sn: 0, p: 0, pn: 0 }; if (i.kind === '매출') { x.s += i.supply; x.sn++; } else { x.p += i.supply; x.pn++; } }
+  const keys = Object.keys(g).sort().reverse();
+  const tot = keys.reduce((a, k) => ({ s: a.s + g[k].s, sn: a.sn + g[k].sn, p: a.p + g[k].p, pn: a.pn + g[k].pn }), { s: 0, sn: 0, p: 0, pn: 0 });
+  const max = Math.max(1, ...keys.map(k => Math.max(g[k].s, g[k].p)));
+  const sel = plSel && g[plSel] ? plSel : null;
+  let detail = '';
+  if (sel) {
+    const li = inv.filter(i => plKey(i.date) === sel), by = (kind) => { const m = {}; for (const i of li.filter(x => x.kind === kind)) { const k = i.bizNo || i.name; const x = m[k] = m[k] || { name: i.name, n: 0, v: 0 }; x.n++; x.v += i.supply; } return Object.values(m).sort((a, b) => b.v - a.v); };
+    const part = (kind) => { const l = by(kind), sum = l.reduce((a, x) => a + x.v, 0); return `<div class="card"><h3>${plLabel(sel)} ${kind}처 ${l.length}곳 <span class="sub" style="font-size:12px;font-weight:400">${won(sum)}원</span></h3>${l.map(x => row(esc(x.name), `${x.n}건 · ${sum ? Math.round(x.v / sum * 100) : 0}%`, won(x.v))).join('') || '<div class="empty">없음</div>'}</div>`; };
+    detail = part('매출') + part('매입') + `<div class="btns"><button class="btn ghost" onclick="plSel=null;render()">기간 목록으로</button>${plUnit === '월' ? `<button class="btn ghost" onclick="invQ='${sel}';invTab='list';go('#invoices/list')">이 달 계산서 목록</button>` : ''}</div>`;
+  }
+  const sel2 = (v, opts, on) => `<select onchange="${on}">${opts.map(o => `<option ${o === v ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
+  return `<div class="toolbar">${sel2(plUnit, ['연도', '분기', '월'], "plUnit=this.value;plSel=null;render()")}${plUnit === '연도' ? '' : sel2(yr, ['전체', ...years.slice().reverse()], "plYear=this.value;plSel=null;render()")}</div>
+  <div class="card"><h3>${plUnit === '연도' || yr === '전체' ? '전체 기간' : yr + '년'} 합계</h3><div class="kv"><div>매출</div><div><b>${won(tot.s)}</b>원 (${tot.sn}건)</div><div>매입</div><div>${won(tot.p)}원 (${tot.pn}건)</div><div>차액</div><div class="${tot.s - tot.p < 0 ? 'red' : 'grn'}">${won(tot.s - tot.p)}원</div></div><div class="note" style="margin-top:6px">공급가액 기준(부가세 제외), 수정(마이너스) 계산서 포함</div></div>
+  ${detail || `<div class="card plt"><div class="plh"><span>기간</span><span>매출</span><span>매입</span><span>차액</span></div>
+  ${keys.map(k => { const x = g[k]; return `<div class="plr" onclick="plSel='${k}';render();window.scrollTo(0,0)"><span>${plLabel(k)}</span><span>${won(x.s)}<small>${x.sn}건</small><i class="bs" style="width:${Math.round(x.s / max * 100)}%"></i></span><span>${won(x.p)}<small>${x.pn}건</small><i class="bp" style="width:${Math.round(x.p / max * 100)}%"></i></span><span class="${x.s - x.p < 0 ? 'red' : ''}">${won(x.s - x.p)}</span></div>`; }).join('')}
+  </div><div class="note">기간을 누르면 그 기간의 매출처·매입처별 합계가 나옵니다.</div>`}`;
 }
 function invList() {
   const q = invQ.toLowerCase(); const c = calc();
@@ -835,14 +862,14 @@ function quoteFromOrder(id) {
 }
 
 /* ---------------- 라우터 ---------------- */
-const TITLES = { orders: '발주 · 견적', home: '이포트텍 ERP', schedule: '유지보수 일정', sites: '사이트', site: '사이트 상세', invoices: '세금계산서', ar: '미수금 · 입금', parts: '부품 재고', settings: '설정' };
+const TITLES = { tech: '기술지원 (유지보수 외)', orders: '발주 · 견적', home: '이포트텍 ERP', schedule: '유지보수 일정', sites: '사이트', site: '사이트 상세', invoices: '세금계산서', ar: '미수금 · 입금', parts: '부품 재고', settings: '설정' };
 function go(h) { location.hash = h; }
 function render(keepFocus) {
   const [name, arg] = (location.hash.slice(1) || 'home').split('/');
   const focusId = keepFocus && document.activeElement && document.activeElement.tagName === 'INPUT' ? document.activeElement : null; const pos = focusId ? focusId.selectionStart : 0; const ph = focusId ? focusId.placeholder : '';
   let html = '';
   if (!DB.sites.length && !DB.invoices.length && name !== 'settings') html = `<div class="card"><h3>처음 시작하기</h3><p class="note">자료가 비어 있습니다. 함께 드린 <b>이포트텍_ERP_초기데이터.json</b> 파일을 불러오면 유지보수 사이트 18곳과 2020~2026 세금계산서가 바로 들어갑니다.</p><div class="btns"><button class="btn" onclick="importJSON()">초기 데이터 불러오기</button><button class="btn ghost" onclick="go('#settings')">구글 시트에서 받기</button></div></div>`;
-  else html = ({ home: viewHome, schedule: viewSchedule, sites: viewSites, site: () => viewSite(arg), invoices: () => viewInvoices(arg), ar: viewAR, parts: viewParts, settings: viewSettings, orders: viewOrders }[name] || viewHome)();
+  else html = ({ home: viewHome, schedule: viewSchedule, sites: viewSites, site: () => viewSite(arg), invoices: () => viewInvoices(arg), ar: viewAR, parts: viewParts, tech: perCallView, settings: viewSettings, orders: viewOrders }[name] || viewHome)();
   $('#view').innerHTML = html; $('#pageTitle').textContent = TITLES[name] || TITLES.home;
   const tab = name === 'site' ? 'sites' : name; document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.tab === tab));
   if (ph) { const el = [...document.querySelectorAll('#view input')].find(x => x.placeholder === ph); if (el) { el.focus(); el.setSelectionRange(pos, pos); } }
