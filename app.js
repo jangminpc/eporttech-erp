@@ -108,7 +108,7 @@ function calc() {
   for (const [id, dt] of Object.entries(DB.manualPaid || {})) if (!c.paidBy[id]) c.paidBy[id] = { date: dt, manual: true };
   _cache = c; return c;
 }
-const siteActiveIn = (s, ym) => s.active !== false && (!s.startMonth || ym >= s.startMonth);
+const siteActiveIn = (s, ym) => s.active !== false && !s.old && (!s.startMonth || ym >= s.startMonth);
 const billExpected = (s, ym) => siteActiveIn(s, ym) && Number(s.amount) > 0 && (!s.billMonths || !s.billMonths.length || s.billMonths.includes(Number(ym.slice(5))));
 const inspectExpected = (s, ym) => siteActiveIn(s, ym) && (!s.inspectMonths || !s.inspectMonths.length || s.inspectMonths.includes(Number(ym.slice(5))));
 function billingStatus(ym) {
@@ -264,17 +264,20 @@ async function delEvent(id) {
 let siteQ = '';
 function viewSites() {
   const ym = ymOf(todayStr()); const c = calc();
-  const list = DB.sites.filter(s => !siteQ || (s.name + s.client + s.equipment + s.note).toLowerCase().includes(siteQ.toLowerCase()));
+  const all = DB.sites.filter(s => !siteQ || (s.name + s.client + s.equipment + s.note).toLowerCase().includes(siteQ.toLowerCase()));
+  const list = all.filter(s => !s.old), olds = all.filter(s => s.old).map(s => { const iv = (c.bySite[s.id] || []).filter(i => i.supply > 0).sort((a, b) => a.date.localeCompare(b.date)); return { s, iv, from: iv.length ? iv[0].date.slice(0, 7) : '', to: iv.length ? iv[iv.length - 1].date.slice(0, 7) : '', sum: iv.reduce((a, i) => a + i.supply, 0) }; }).sort((a, b) => b.to.localeCompare(a.to) || b.sum - a.sum);
   const ins = Object.fromEntries(inspectStatus(ym).map(x => [x.site.id, x]));
-  const total = DB.sites.filter(s => s.active !== false).reduce((a, s) => a + (s.billMonths && s.billMonths.length ? s.amount * s.billMonths.length / 12 : s.amount), 0);
+  const total = DB.sites.filter(s => s.active !== false && !s.old).reduce((a, s) => a + (s.billMonths && s.billMonths.length ? s.amount * s.billMonths.length / 12 : s.amount), 0);
   return `<div class="toolbar"><input id="siteQ" placeholder="사이트·업체·장비 검색" value="${esc(siteQ)}" oninput="siteQ=this.value;render(true)"><button class="btn" onclick="siteForm()">+ 사이트</button></div>
-  <div class="card"><h3>유지보수 사이트 ${DB.sites.filter(s => s.active !== false).length}곳 <span class="sub" style="font-size:12px;font-weight:400">월 환산 ${won(total)}원</span></h3>
+  <div class="card"><h3>유지보수 사이트 ${DB.sites.filter(s => s.active !== false && !s.old).length}곳 <span class="sub" style="font-size:12px;font-weight:400">월 환산 ${won(total)}원</span></h3>
   ${list.map(s => {
     const last = (c.bySite[s.id] || []).filter(i => i.supply > 0).sort((a, b) => b.date.localeCompare(a.date))[0];
     const st = ins[s.id];
     return row(`${esc(s.name)} ${s.active === false ? '<span class="badge">종료</span>' : st ? (st.done ? '<span class="badge grn">점검완료</span>' : '<span class="badge org">미점검</span>') : ''}`,
       `${esc(s.client)} · ${esc(s.cycle)}${last ? ' · 최근 발행 ' + last.date.slice(2) : ''}`, won(s.amount), `onclick="go('#site/${s.id}')"`);
-  }).join('') || '<div class="empty">사이트가 없습니다</div>'}</div>`;
+  }).join('') || '<div class="empty">사이트가 없습니다</div>'}</div>
+  ${olds.length ? `<details class="card" ${siteQ ? 'open' : ''}><summary><h3 style="display:inline">지난 유지보수 (old) ${olds.length}곳 <span class="sub" style="font-size:12px;font-weight:400">누적 ${won(olds.reduce((a, x) => a + x.sum, 0))}원</span></h3></summary>
+  ${olds.map(x => row(`${esc(x.s.name)} <span class="badge">old</span>`, `${esc(x.s.client)} · ${x.from.replace('-', '.')}~${x.to.replace('-', '.')} · ${x.iv.length}건`, won(x.sum), `onclick="go('#site/${x.s.id}')"`)).join('')}</details>` : ''}`;
 }
 function viewSite(id) {
   const s = DB.sites.find(x => x.id === id); if (!s) return '<div class="empty">없는 사이트</div>';
@@ -358,7 +361,9 @@ function viewInvoices(sub) {
 const PC_CATS = [['장애처리', /장애|출동|복구|고장|에러|오류|긴급|디스크 ?교체|부품 ?교체|교체/], ['설치·이전', /설치|이전|이설|구축|마이그|납품|공급|증설/], ['기술지원', /지원|점검|컨설팅|작업|패치|업그레이드/]];
 const pcCat = t => (PC_CATS.find(([, re]) => re.test(t || '')) || ['기타'])[0];
 const PC_COLOR = { '장애처리': 'red', '설치·이전': '', '기술지원': 'grn', '기타': '' };
-function perCallInvoices() { const c = calc(); return DB.invoices.filter(i => i.kind === '매출' && !c.siteOf[i.id] && !c.cancelled.has(i.id) && i.supply > 0); }
+// 품목명에 "N월"(N월분, N~M월 포함, "N월 N일" 같은 날짜는 제외)이 있으면 유지보수로 봄
+const isMaintItem = t => /(^|[^0-9])(1[0-2]|[1-9])\s*월(?!\s*\d+\s*일)/.test(t || '');
+function perCallInvoices() { const c = calc(); return DB.invoices.filter(i => i.kind === '매출' && !c.siteOf[i.id] && !c.cancelled.has(i.id) && i.supply > 0 && !isMaintItem(i.item)); }
 let pcYM = null, pcCatF = '전체';
 function perCallView() {
   const ym = pcYM || ymOf(todayStr()), year = ym.slice(0, 4);
@@ -380,7 +385,7 @@ function perCallView() {
   ${invs.sort((a, b) => a.date.localeCompare(b.date)).map(i => { const k = pcCat(i.item); return row(`${esc(i.item)} <span class="badge ${PC_COLOR[k]}">${k}</span>`, `${i.date.slice(5)} · ${esc(i.name)}`, won(i.supply), `onclick="invDetail('${i.id}')"`); }).join('') || '<div class="empty">없음</div>'}</div>
   ${evs.length ? `<div class="card"><h3>작업 기록 ${evs.length}건</h3>${evs.map(e => row(`${esc(e.title || e.type)} <span class="badge ${PC_COLOR[pcCat(e.type)] || ''}">${esc(e.type)}</span>`, `${e.date.slice(5)} · ${esc(siteName(e.siteId))}`, '', `onclick="go('#site/${e.siteId}')"`)).join('')}</div>` : ''}
   ${ods.length ? `<div class="card"><h3>계산서 전 (발주·요청) ${ods.length}건</h3>${ods.map(o => row(`${esc(o.title)} <span class="badge org">${esc(o.status)}</span>`, `${o.date.slice(5)} · ${esc(o.client || o.customer || '')}`, o.amount ? won(o.amount) : '', `onclick="go('#orders')"`)).join('')}</div>` : ''}
-  <div class="note">유지보수 사이트에 연결되지 않은 매출 계산서를 퍼콜·장애 작업으로 봅니다. 종류는 품목명 단어(장애·출동·교체 → 장애처리, 설치·이전·납품 → 설치·이전, 지원·작업 → 기술지원)로 나눕니다. 계산서를 눌러 사이트에 연결하면 유지보수로 옮겨 갑니다.</div>`;
+  <div class="note">유지보수 사이트(old 포함)에 연결되지 않고 품목명에 "N월"이 없는 매출 계산서를 퍼콜·장애 작업으로 봅니다. 종류는 품목명 단어(장애·출동·교체 → 장애처리, 설치·이전·납품 → 설치·이전, 지원·작업 → 기술지원)로 나눕니다. 계산서를 눌러 사이트에 연결하면 유지보수로 옮겨 갑니다.</div>`;
 }
 /* ---------------- 매출·매입 기간별 ---------------- */
 let plUnit = '분기', plYear = null, plSel = null;
