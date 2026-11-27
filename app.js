@@ -21,8 +21,8 @@ const IDB = {
   async get(k) { const db = await this.open(); return new Promise(ok => { const t = db.transaction('kv').objectStore('kv').get(k); t.onsuccess = () => ok(t.result); t.onerror = () => ok(null); }); },
   async set(k, v) { const db = await this.open(); return new Promise(ok => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = () => ok(); }); }
 };
-function blankDB() { return { version: 1, settings: { company: '이포트텍', bizNo: '599-01-01772', arStart: '2026-09-01', syncUrl: '', syncToken: '', owner: '', tel: '', email: '', address: '' }, sites: [], invoices: [], events: [], parts: [], deposits: [], manualPaid: {}, orders: [], changes: [], mailSeen: [], quotes: [] }; }
-async function save() { DB.updated = new Date().toISOString(); await IDB.set('db', DB); invalidate(); schedulePush(); }
+function blankDB() { return { version: 1, settings: { company: '이포트텍', bizNo: '599-01-01772', arStart: '2026-09-01', syncUrl: '', syncToken: '', owner: '', tel: '', email: '', address: '' }, sites: [], invoices: [], events: [], parts: [], deposits: [], manualPaid: {}, orders: [], changes: [], mailSeen: [], quotes: [], billReqs: [], contacts: [], log: [], dunning: {} }; }
+async function save() { diffLog(); DB.updated = new Date().toISOString(); await IDB.set('db', DB); invalidate(); schedulePush(); }
 async function persist() { await IDB.set('db', DB); invalidate(); } // 동기화 표시만 바꿀 때 (변경으로 치지 않음)
 
 /* ---------------- 자동 동기화: 고치면 몇 초 뒤 시트로 올리고, 앱을 열거나 다시 보면 시트의 새 자료를 받음 ---------------- */
@@ -32,7 +32,7 @@ let _pushT = null, _pushing = false, _pulling = false;
 function schedulePush() { if (!syncReady()) return; clearTimeout(_pushT); _pushT = setTimeout(autoPush, 3000); }
 async function pushNow() {
   const s = DB.settings, u = DB.updated; const { syncUrl, syncToken, lastSync, ...rest } = s;
-  const r = await fetch(s.syncUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: syncToken, data: { ...DB, settings: rest } }) });
+  const r = await fetch(s.syncUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: syncToken, data: { ...DB, settings: rest, cal: s.calSync === false ? null : calItems() } }) });
   const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
   s.lastSync = u; await persist(); syncBadge();
 }
@@ -52,7 +52,7 @@ async function autoPull() {
     const d = j.data;
     if (d && (first || ((d.updated || '') > (DB.updated || '') && !isDirty()))) {
       const keep = { syncUrl: s.syncUrl, syncToken: s.syncToken, lastSync: d.updated };
-      DB = Object.assign(blankDB(), d); DB.settings = Object.assign(blankDB().settings, d.settings, keep); await persist();
+      DB = Object.assign(blankDB(), d); DB.settings = Object.assign(blankDB().settings, d.settings, keep); _snap = null; diffLog(); await persist();
       const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
       if (!typing && document.getElementById('modal').classList.contains('hidden')) render(); toast('다른 기기에서 바꾼 내용을 받았습니다');
     } else if (!d) { if (!DB.updated) DB.updated = new Date().toISOString(); DB.settings.lastSync = ''; await autoPush(); }
@@ -73,12 +73,14 @@ let _cache = null; const invalidate = () => { _cache = null; };
 
 /* ---------------- 계산 ---------------- */
 function siteForInvoice(inv) {
-  if (inv.kind !== '매출') return null;
   if (inv.siteId) return DB.sites.find(s => s.id === inv.siteId) || null;
-  let best = null;
+  if (inv.kind !== '매출') return null; // 매입은 직접 연결한 것만 (사이트 원가)
+  let best = null, bestLen = 0; const it = (inv.item || '').toLowerCase();
   for (const s of DB.sites) {
     const bizOk = s.bizNo ? s.bizNo === inv.bizNo : normName(inv.name).includes(normName(s.client));
-    if (bizOk && s.keyword && inv.item.toLowerCase().includes(s.keyword.toLowerCase())) { if (!best || s.keyword.length > best.keyword.length) best = s; }
+    if (!bizOk || !s.keyword) continue;
+    // 단어 여러 개는 | 또는 , 로 구분 (예: 해병대|해군|계룡대)
+    for (const k of String(s.keyword).split(/[|,]/).map(x => x.trim().toLowerCase()).filter(Boolean)) if (it.includes(k) && k.length > bestLen) { best = s; bestLen = k.length; }
   }
   return best;
 }
@@ -98,6 +100,7 @@ function calc() {
   const c = { siteOf: {}, period: {}, cancelled: new Set(), paidBy: {}, bySite: {} };
   const sales = DB.invoices.filter(i => i.kind === '매출');
   for (const i of sales) { const s = siteForInvoice(i); c.siteOf[i.id] = s ? s.id : null; c.period[i.id] = periodOf(i, s); if (s) (c.bySite[s.id] = c.bySite[s.id] || []).push(i); }
+  c.costBySite = {}; for (const i of DB.invoices) if (i.kind === '매입' && i.siteId) { c.siteOf[i.id] = i.siteId; (c.costBySite[i.siteId] = c.costBySite[i.siteId] || []).push(i); }
   // 수정(마이너스) 계산서와 원래 계산서를 짝지어 미수금에서 제외
   const negs = sales.filter(i => i.supply < 0);
   for (const n of negs) {
@@ -105,10 +108,12 @@ function calc() {
     c.cancelled.add(n.id); if (cand[0]) c.cancelled.add(cand[0].id);
   }
   for (const d of DB.deposits) for (const id of (d.invIds || [])) c.paidBy[id] = { date: d.date, dep: d.id };
+  c.credit = {}; for (const d of DB.deposits) if (d.prepaid) c.credit[d.id] = d.amount - (d.invIds || []).reduce((a, id) => a + ((DB.invoices.find(i => i.id === id) || {}).total || 0), 0);
   for (const [id, dt] of Object.entries(DB.manualPaid || {})) if (!c.paidBy[id]) c.paidBy[id] = { date: dt, manual: true };
   _cache = c; return c;
 }
-const siteActiveIn = (s, ym) => s.active !== false && !s.old && (!s.startMonth || ym >= s.startMonth);
+const isAdhoc = s => /^수시/.test(s.cycle || '');
+const siteActiveIn = (s, ym) => s.active !== false && !s.old && !isAdhoc(s) && (!s.startMonth || ym >= s.startMonth);
 const billExpected = (s, ym) => siteActiveIn(s, ym) && Number(s.amount) > 0 && (!s.billMonths || !s.billMonths.length || s.billMonths.includes(Number(ym.slice(5))));
 const inspectExpected = (s, ym) => siteActiveIn(s, ym) && (!s.inspectMonths || !s.inspectMonths.length || s.inspectMonths.includes(Number(ym.slice(5))));
 function billingStatus(ym) {
@@ -181,21 +186,24 @@ function viewHome() {
   let rest = 0; const curNet = bill.reduce((a, x) => a + Math.max(0, x.net), 0);
   rest += Math.max(0, expectedOfMonth(ym) - curNet);
   for (let k = 1; ymAdd(ym, k).startsWith(y); k++) rest += expectedOfMonth(ymAdd(ym, k));
-  return `
+  setBadge();
+  return `${todayCard()}
   <div class="grid4">
     <div class="stat" onclick="go('#schedule')"><div class="k">${Number(ym.slice(5))}월 점검</div><div class="v ${insDone < ins.length ? 'org' : 'grn'}">${insDone}/${ins.length}</div><div class="s">${ins.filter(x => x.late).length ? '미점검 ' + ins.filter(x => x.late).length + '곳' : '남은 점검 ' + (ins.length - insDone) + '곳'}</div></div>
     <div class="stat" onclick="go('#invoices')"><div class="k">${Number(ym.slice(5))}월 계산서</div><div class="v ${billLeft.length ? 'org' : 'grn'}">${billDone.length}/${bill.length}</div><div class="s">미발행 ${man(billLeft.reduce((a, x) => a + x.site.amount, 0))}원</div></div>
     <div class="stat" onclick="go('#ar')"><div class="k">미수금</div><div class="v ${ar.length ? 'red' : 'grn'}">${man(arSum)}</div><div class="s">${ar.length}건 (부가세 포함)</div></div>
     <div class="stat" onclick="go('#parts')"><div class="k">재고 부족</div><div class="v ${low.length ? 'red' : ''}">${low.length}</div><div class="s">품목 ${DB.parts.length}개</div></div>
   </div>
+  ${dunCard()}
   ${homeMailCards()}
+  ${warrantyCard()}
   <div class="card" style="margin-top:12px"><h3>${y}년 매출 <a href="#invoices/forecast">자세히</a></h3>
     <div class="kv"><div>실제 발행</div><div><b>${won(ytd)}</b>원</div><div>남은 예상</div><div>${won(rest)}원 (정기 유지보수)</div><div>연말 예상</div><div><b>${won(ytd + rest)}</b>원</div></div></div>
   <div class="card"><h3>이번 달 아직 점검 안 한 사이트 <a href="#schedule">일정</a></h3>
     ${ins.filter(x => !x.done).slice(0, 8).map(x => row(esc(x.site.name), `${esc(x.site.client)} · 예정 ${x.plan.slice(5)} · ${esc(x.site.inspect || '방문')}`, x.late ? '<span class="badge red">지남</span>' : '<span class="badge">예정</span>', `onclick="quickInspect('${x.site.id}')"`)).join('') || '<div class="empty">모두 점검했습니다 👍</div>'}
     <div class="note">사이트를 누르면 바로 점검 완료로 기록됩니다.</div></div>
   <div class="card"><h3>이번 달 발행할 계산서 <a href="#invoices">계산서</a></h3>
-    ${billLeft.map(x => row(esc(x.site.name), `${esc(x.site.client)} · ${esc(x.site.cycle)}`, won(x.site.amount), `onclick="go('#site/${x.site.id}')"`)).join('') || '<div class="empty">모두 발행했습니다 👍</div>'}</div>
+    ${billLeft.map(x => { const rq = reqFor(x.site.id, ym); return row(`${esc(x.site.name)} ${rq ? '<span class="badge blue">발행요청</span>' : ''}`, `${esc(x.site.client)} · ${esc(billItemFor(x.site, ym))}`, `${won(x.site.amount)}<br><button class="btn sm ${rq ? 'ghost' : ''}" onclick="event.stopPropagation();billPrep({siteId:'${x.site.id}',ym:'${ym}'})">${rq ? '요청 수정' : '발행 준비'}</button>`, `onclick="go('#site/${x.site.id}')"`); }).join('') || '<div class="empty">모두 발행했습니다 👍</div>'}</div>
   ${soon.length ? `<div class="card"><h3>계약 만료·갱신 확인</h3>${soon.map(s => row(esc(s.name), esc(s.contract), `<span class="badge ${s.endMonth < ym ? 'red' : 'org'}">${s.endMonth < ym ? '지남' : '임박'} ${s.endMonth}</span>`, `onclick="go('#site/${s.id}')"`)).join('')}</div>` : ''}
   ${ar.length ? `<div class="card"><h3>오래된 미수금 <a href="#ar">전체</a></h3>${ar.slice(0, 5).map(x => row(esc(x.inv.name), `${x.inv.date} · ${esc(x.inv.item)}`, `${won(x.inv.total)}<br><small class="${x.age > 60 ? 'red' : 'sub'}">${x.age}일</small>`)).join('')}</div>` : ''}
   `;
@@ -224,7 +232,8 @@ function viewSchedule() {
   <div class="card"><h3>이 달의 작업 기록 <a href="javascript:eventForm({date:'${todayStr()}'})">+ 기록</a></h3>
     ${others.map(e => row(`${esc(siteName(e.siteId))} <span class="badge blue">${esc(e.type)}</span>`, `${e.date} · ${esc(e.title || '')}${e.partId ? ' · 부품 ' + esc(partName(e.partId)) + ' ×' + e.partQty : ''}`, '', `onclick="eventForm(DB.events.find(x=>x.id==='${e.id}'))"`)).join('') || '<div class="empty">기록 없음</div>'}
   </div>
-  <div class="note">“캘린더”를 누르면 구글 캘린더에 점검 일정이 추가됩니다. 점검 예정일은 사이트 정보의 ‘점검 예정일(매월 며칠)’로 바꿀 수 있습니다.</div>`;
+  <div class="btns"><button class="btn ghost" onclick="downloadICS()">앞으로 3개월 일정 캘린더 파일(.ics)</button></div>
+  <div class="note">구글 시트 연결 시 점검 예정·발주 납기·앞으로의 작업 기록이 구글 캘린더에 자동으로 올라갑니다(설정에서 끌 수 있음). “캘린더”를 누르면 한 건씩 직접 추가됩니다. 점검 예정일은 사이트 정보의 ‘점검 예정일(매월 며칠)’로 바꿀 수 있습니다.</div>`;
 }
 function gcalUrl(s, date) {
   const d = date.replace(/-/g, ''); const n = new Date(date); n.setDate(n.getDate() + 1);
@@ -243,6 +252,7 @@ function eventForm(e) {
     { k: 'memo', label: '내용', type: 'textarea', value: e.memo, ph: '점검 결과, 장애 원인, 조치 내용' },
     { k: 'partId', label: '사용한 부품 (재고에서 빠짐)', type: 'select', options: popts, value: e.partId },
     { k: 'partQty', label: '부품 수량', type: 'number', value: e.partQty || 1 },
+    ...(allAssets().length ? [{ k: 'assetId', label: '대상 장비 (장비 대장)', type: 'select', options: [['', '(선택 안 함)'], ...allAssets().filter(x => !e.siteId || x.site.id === e.siteId).map(x => [x.a.id, `${x.site.name} · ${assetLabel(x.a)}`])], value: e.assetId }] : []),
   ], o => {
     if (!o.siteId) { toast('사이트를 선택하세요'); return false; }
     if (!o.partId) o.partQty = 0;
@@ -268,13 +278,13 @@ function viewSites() {
   const list = all.filter(s => !s.old), olds = all.filter(s => s.old).map(s => { const iv = (c.bySite[s.id] || []).filter(i => i.supply > 0).sort((a, b) => a.date.localeCompare(b.date)); return { s, iv, from: iv.length ? iv[0].date.slice(0, 7) : '', to: iv.length ? iv[iv.length - 1].date.slice(0, 7) : '', sum: iv.reduce((a, i) => a + i.supply, 0) }; }).sort((a, b) => b.to.localeCompare(a.to) || b.sum - a.sum);
   const ins = Object.fromEntries(inspectStatus(ym).map(x => [x.site.id, x]));
   const total = DB.sites.filter(s => s.active !== false && !s.old).reduce((a, s) => a + (s.billMonths && s.billMonths.length ? s.amount * s.billMonths.length / 12 : s.amount), 0);
-  return `<div class="toolbar"><input id="siteQ" placeholder="사이트·업체·장비 검색" value="${esc(siteQ)}" oninput="siteQ=this.value;render(true)"><button class="btn" onclick="siteForm()">+ 사이트</button></div>
+  return sitesSeg('sites') + `<div class="toolbar"><input id="siteQ" placeholder="사이트·업체·장비 검색" value="${esc(siteQ)}" oninput="siteQ=this.value;render(true)"><button class="btn" onclick="siteForm()">+ 사이트</button></div>
   <div class="card"><h3>유지보수 사이트 ${DB.sites.filter(s => s.active !== false && !s.old).length}곳 <span class="sub" style="font-size:12px;font-weight:400">월 환산 ${won(total)}원</span></h3>
   ${list.map(s => {
     const last = (c.bySite[s.id] || []).filter(i => i.supply > 0).sort((a, b) => b.date.localeCompare(a.date))[0];
     const st = ins[s.id];
     return row(`${esc(s.name)} ${s.active === false ? '<span class="badge">종료</span>' : st ? (st.done ? '<span class="badge grn">점검완료</span>' : '<span class="badge org">미점검</span>') : ''}`,
-      `${esc(s.client)} · ${esc(s.cycle)}${last ? ' · 최근 발행 ' + last.date.slice(2) : ''}`, won(s.amount), `onclick="go('#site/${s.id}')"`);
+      `${esc(s.client)} · ${esc(s.cycle)}${last ? ' · 최근 발행 ' + last.date.slice(2) : ''}`, isAdhoc(s) ? `<small class="sub">올해</small> ${won((c.bySite[s.id] || []).filter(i => i.date.startsWith(ym.slice(0, 4))).reduce((a, i) => a + i.supply, 0))}` : won(s.amount), `onclick="go('#site/${s.id}')"`);
   }).join('') || '<div class="empty">사이트가 없습니다</div>'}</div>
   ${olds.length ? `<details class="card" ${siteQ ? 'open' : ''}><summary><h3 style="display:inline">지난 유지보수 (old) ${olds.length}곳 <span class="sub" style="font-size:12px;font-weight:400">누적 ${won(olds.reduce((a, x) => a + x.sum, 0))}원</span></h3></summary>
   ${olds.map(x => row(`${esc(x.s.name)} <span class="badge">old</span>`, `${esc(x.s.client)} · ${x.from.replace('-', '.')}~${x.to.replace('-', '.')} · ${x.iv.length}건`, won(x.sum), `onclick="go('#site/${x.s.id}')"`)).join('')}</details>` : ''}`;
@@ -284,10 +294,12 @@ function viewSite(id) {
   const c = calc();
   const invs = (c.bySite[id] || []).slice().sort((a, b) => b.date.localeCompare(a.date));
   const evs = DB.events.filter(e => e.siteId === id);
-  const items = [...evs.map(e => ({ d: e.date, h: `<div class="it"><b>${esc(e.type)}</b> ${esc(e.title || '')}<br><small>${e.date}${e.memo ? ' · ' + esc(e.memo) : ''}${e.partId ? ' · 부품 ' + esc(partName(e.partId)) + ' ×' + e.partQty : ''}</small></div>`, click: `eventForm(DB.events.find(x=>x.id==='${e.id}'))` })),
+  const costs = (c.costBySite[id] || []).slice();
+  const items = [...costs.map(i => ({ d: i.date, h: `<div class="it inv"><b>매입</b> ${esc(i.item)} <span class="red">-${won(i.supply)}원</span><br><small>${i.date} · ${esc(i.name)}</small></div>`, click: `invDetail('${i.id}')` })),...evs.map(e => ({ d: e.date, h: `<div class="it"><b>${esc(e.type)}</b> ${esc(e.title || '')}<br><small>${e.date}${e.memo ? ' · ' + esc(e.memo) : ''}${e.partId ? ' · 부품 ' + esc(partName(e.partId)) + ' ×' + e.partQty : ''}${e.assetId && assetById(e.assetId) ? ' · 장비 ' + esc(assetLabel(assetById(e.assetId))) : ''}</small></div>`, click: `eventForm(DB.events.find(x=>x.id==='${e.id}'))` })),
     ...invs.map(i => ({ d: i.date, h: `<div class="it inv"><b>계산서</b> ${esc(i.item)} <span class="${i.supply < 0 ? 'red' : ''}">${won(i.supply)}원</span><br><small>${i.date} · ${esc(i.name)} · ${c.cancelled.has(i.id) ? '수정/취소' : c.paidBy[i.id] ? '입금 ' + c.paidBy[i.id].date : (i.date >= DB.settings.arStart ? '<span class="red">미입금</span>' : '')}</small></div>` }))]
     .sort((a, b) => b.d.localeCompare(a.d));
   const yr = todayStr().slice(0, 4); const yrSum = invs.filter(i => i.date.startsWith(yr)).reduce((a, i) => a + i.supply, 0);
+  const pf = siteProfit(s, yr);
   const ar = receivables().filter(x => c.siteOf[x.inv.id] === id);
   return `<div class="btns"><a class="btn ghost sm" href="#sites">← 목록</a></div>
   <div class="card"><h3>${esc(s.name)} <a href="javascript:siteForm(DB.sites.find(x=>x.id==='${id}'))">수정</a></h3>
@@ -300,9 +312,13 @@ function viewSite(id) {
     <div>담당자</div><div>${esc(s.contact || '-')}</div>
     <div>메모</div><div>${esc(s.note || '-')}</div>
     <div>${yr}년 매출</div><div><b>${won(yrSum)}</b>원 · 미수 ${won(ar.reduce((a, x) => a + x.inv.total, 0))}원</div>
+    <div>${yr}년 원가</div><div>${won(pf.cost)}원 <small class="sub">(매입 ${won(pf.buy)} + 부품 ${won(pf.parts)})</small></div>
+    <div>${yr}년 이익</div><div class="${pf.profit < 0 ? 'red' : 'grn'}"><b>${won(pf.profit)}</b>원${pf.sales ? ` (${Math.round(pf.profit / pf.sales * 100)}%)` : ''}</div>
+    ${s.itemTpl ? `<div>품목명 틀</div><div>${esc(s.itemTpl)}</div>` : ''}
   </div>
-  <div class="btns"><button class="btn grn" onclick="quickInspect('${id}')">점검 완료 기록</button><button class="btn ghost" onclick="eventForm({siteId:'${id}',type:'장애처리',date:'${todayStr()}'})">장애·출동 기록</button></div></div>
-  <div class="card"><h3>히스토리 <span class="sub" style="font-size:12px;font-weight:400">작업 ${evs.length} · 계산서 ${invs.length}</span></h3>
+  <div class="btns"><button class="btn grn" onclick="quickInspect('${id}')">점검 완료 기록</button><button class="btn ghost" onclick="eventForm({siteId:'${id}',type:'장애처리',date:'${todayStr()}'})">장애·출동 기록</button>${s.amount > 0 || isAdhoc(s) ? `<button class="btn ghost" onclick="billPrep({siteId:'${id}'})">계산서 발행 준비</button>` : ''}</div></div>
+  ${assetCard(s)}
+  <div class="card"><h3>히스토리 <span class="sub" style="font-size:12px;font-weight:400">작업 ${evs.length} · 계산서 ${invs.length}${costs.length ? ' · 매입 ' + costs.length : ''}</span></h3>
   <div class="tl">${items.slice(0, 80).map(x => x.click ? `<div onclick="${x.click}" style="cursor:pointer">${x.h}</div>` : x.h).join('') || '<div class="empty">기록 없음</div>'}</div></div>`;
 }
 function siteForm(s) {
@@ -311,9 +327,10 @@ function siteForm(s) {
     { k: 'name', label: '사이트 이름 (최종 고객)', value: s.name },
     { k: 'client', label: '계산서 발행처 (중간업체)', value: s.client },
     { k: 'bizNo', label: '발행처 사업자번호', value: s.bizNo, ph: '000-00-00000' },
-    { k: 'keyword', label: '계산서 품목명에 들어가는 단어 (자동 대조용)', value: s.keyword, ph: '예: 경기대' },
+    { k: 'keyword', label: '계산서 품목명에 들어가는 단어 (자동 대조용, 여러 개는 | 로 구분)', value: s.keyword, ph: '예: 경기대  또는  해병대|해군|계룡대' },
     { k: 'amount', label: '1회 발행 금액 (공급가액)', type: 'number', value: s.amount },
-    { k: 'cycle', label: '주기', type: 'select', options: ['매월', '분기', '반기', '3개월 후불', '연간', '기타'], value: s.cycle },
+    { k: 'cycle', label: '주기 (수시 = 정기 계약 없이 기술지원만)', type: 'select', options: ['매월', '분기', '반기', '3개월 후불', '연간', '수시', '기타'], value: s.cycle },
+    { k: 'itemTpl', label: '계산서 품목명 틀 (비우면 지난 계산서 품목명에서 달만 바꿈)', value: s.itemTpl, ph: '예: {사이트} {월}월 정기점검  ·  {0월}=05월, {분기}, {년}' },
     { k: 'billMonths', label: '발행하는 달 (매월이면 비워두기, 예: 3,6,9,12)', value: (s.billMonths || []).join(',') },
     { k: 'startMonth', label: '시작 월 (예: 2026-08)', value: s.startMonth },
     { k: 'contract', label: '계약 기간 메모', value: s.contract },
@@ -338,8 +355,9 @@ function siteForm(s) {
 let invYM = null, invTab = 'month', invQ = '', invKind = '매출';
 function viewInvoices(sub) {
   if (sub) invTab = sub;
-  const seg = `<div class="seg"><a href="#invoices/month" class="${invTab === 'month' ? 'on' : ''}">월별 발행 점검</a><a href="#invoices/list" class="${invTab === 'list' ? 'on' : ''}">전체 목록</a><a href="#invoices/pl" class="${invTab === 'pl' ? 'on' : ''}">매출·매입</a><a href="#invoices/forecast" class="${invTab === 'forecast' ? 'on' : ''}">매출 예상</a></div>`;
+  const seg = `<div class="seg"><a href="#invoices/month" class="${invTab === 'month' ? 'on' : ''}">월별 발행</a><a href="#invoices/req" class="${invTab === 'req' ? 'on' : ''}">발행요청${pendingReqs().length ? ' ' + pendingReqs().length : ''}</a><a href="#invoices/list" class="${invTab === 'list' ? 'on' : ''}">전체 목록</a><a href="#invoices/pl" class="${invTab === 'pl' ? 'on' : ''}">매출·매입</a><a href="#invoices/forecast" class="${invTab === 'forecast' ? 'on' : ''}">매출 예상</a></div>`;
   if (invTab === 'list') return seg + invList();
+  if (invTab === 'req') return seg + reqView();
   if (invTab === 'pl') return seg + plView();
   if (invTab === 'forecast') return seg + forecast();
   const ym = invYM || ymOf(todayStr()); const st = billingStatus(ym);
@@ -349,12 +367,13 @@ function viewInvoices(sub) {
   return seg + `<div class="monthnav"><button onclick="invYM='${ymAdd(ym, -1)}';render()">◀</button>${ymLabel(ym)}<button onclick="invYM='${ymAdd(ym, 1)}';render()">▶</button></div>
   <div class="card"><h3>정기 유지보수 ${st.filter(x => x.done).length}/${st.length}건 발행</h3>
   <div class="kv"><div>예정</div><div>${won(exp)}원</div><div>발행</div><div><b>${won(got)}</b>원</div><div>남음</div><div class="${exp - got > 0 ? 'org' : ''}">${won(Math.max(0, exp - got))}원</div></div>
-  ${st.map(x => row(`${esc(x.site.name)} ${x.done ? '<span class="badge grn">발행</span>' : '<span class="badge org">미발행</span>'}`,
-    x.done ? x.invs.filter(i => i.supply > 0).map(i => i.date.slice(5) + ' ' + esc(i.item)).join(' / ') : `${esc(x.site.client)} · ${esc(x.site.cycle)}`, won(x.done ? x.net : x.site.amount), `onclick="go('#site/${x.site.id}')"`)).join('')}
+  ${st.map(x => { const rq = reqFor(x.site.id, ym); return row(`${esc(x.site.name)} ${x.done ? '<span class="badge grn">발행</span>' : rq ? '<span class="badge blue">발행요청</span>' : '<span class="badge org">미발행</span>'}`,
+    x.done ? x.invs.filter(i => i.supply > 0).map(i => i.date.slice(5) + ' ' + esc(i.item)).join(' / ') : `${esc(x.site.client)} · ${esc(billItemFor(x.site, ym))}`, x.done ? won(x.net) : `${won(x.site.amount)}<br><button class="btn sm ${rq ? 'ghost' : ''}" onclick="event.stopPropagation();billPrep({siteId:'${x.site.id}',ym:'${ym}'})">${rq ? '요청 수정' : '발행 준비'}</button>`, `onclick="go('#site/${x.site.id}')"`); }).join('')}
+  ${st.some(x => !x.done && !reqFor(x.site.id, ym)) ? `<div class="btns"><button class="btn" onclick="billPrepAll('${ym}')">미발행 ${st.filter(x => !x.done && !reqFor(x.site.id, ym)).length}건 모두 발행요청</button></div>` : ''}
   </div>
   <div class="card"><h3>그 외 매출 (비정기) ${extra.length}건 <span class="sub" style="font-size:12px;font-weight:400">${won(extra.reduce((a, i) => a + i.supply, 0))}원</span></h3>
   ${extra.map(i => row(esc(i.name), `${i.date} · ${esc(i.item)}`, won(i.supply), `onclick="invDetail('${i.id}')"`)).join('') || '<div class="empty">없음</div>'}</div>
-  <div class="btns"><button class="btn" onclick="importHometax()">홈택스 파일 올리기</button></div>
+  <div class="btns"><button class="btn ghost" onclick="billPrep({})">+ 비정기 계산서 발행 준비</button><button class="btn" onclick="importHometax()">홈택스 파일 올리기</button></div>
   <div class="note">홈택스 ‘매출/매입 전자세금계산서 목록조회’에서 받은 엑셀(.xls/.xlsx) 또는 CSV를 올리면 새 계산서만 추가되고, 사업자번호와 품목명으로 사이트에 자동 연결됩니다. 품목명에 “10월” 같은 표시가 있으면 그 달 몫으로 봅니다.</div>`;
 }
 /* ---------------- 퍼콜·장애처리 (유지보수 외 작업) 월별 ---------------- */
@@ -363,7 +382,7 @@ const pcCat = t => (PC_CATS.find(([, re]) => re.test(t || '')) || ['기타'])[0]
 const PC_COLOR = { '장애처리': 'red', '설치·이전': '', '기술지원': 'grn', '기타': '' };
 // 품목명에 "N월"(N월분, N~M월 포함, "N월 N일" 같은 날짜는 제외)이 있으면 유지보수로 봄
 const isMaintItem = t => /(^|[^0-9])(1[0-2]|[1-9])\s*월(?!\s*\d+\s*일)/.test(t || '');
-function perCallInvoices() { const c = calc(); return DB.invoices.filter(i => i.kind === '매출' && !c.siteOf[i.id] && !c.cancelled.has(i.id) && i.supply > 0 && !isMaintItem(i.item)); }
+function perCallInvoices() { const c = calc(); return DB.invoices.filter(i => i.kind === '매출' && (!c.siteOf[i.id] || isAdhoc(DB.sites.find(s => s.id === c.siteOf[i.id]) || {})) && !c.cancelled.has(i.id) && i.supply > 0 && !isMaintItem(i.item)); }
 let pcYM = null, pcCatF = '전체';
 function perCallView() {
   const ym = pcYM || ymOf(todayStr()), year = ym.slice(0, 4);
@@ -431,8 +450,8 @@ function invDetail(id) {
   <div>품목</div><div>${esc(i.item)}</div><div>공급가액</div><div>${won(i.supply)}</div><div>세액</div><div>${won(i.tax)}</div><div>합계</div><div><b>${won(i.total)}</b></div>
   <div>승인번호</div><div><small>${esc(i.id)}</small></div>
   <div>입금</div><div>${c.cancelled.has(i.id) ? '수정/취소 건' : c.paidBy[i.id] ? '입금 ' + c.paidBy[i.id].date + (c.paidBy[i.id].manual ? ' (직접 확인)' : ' (통장 대조)') : '<span class="red">미입금</span>'}</div></div>
-  ${i.kind === '매출' ? `<label class="f" style="margin-top:12px">연결 사이트<select id="invSite">${opts.map(([v, l]) => `<option value="${v}" ${v === (i.siteId || '') ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>` : ''}
-  <div class="btns">${i.kind === '매출' ? `<button class="btn" onclick="saveInvSite('${id}')">저장</button>` : ''}
+  <label class="f" style="margin-top:12px">${i.kind === '매출' ? '연결 사이트' : '연결 사이트 (이 매입을 사이트 원가로 잡기)'}<select id="invSite">${(i.kind === '매출' ? opts : [['', '(연결 안 함)'], ...DB.sites.map(s => [s.id, s.name])]).map(([v, l]) => `<option value="${v}" ${v === (i.siteId || '') ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+  <div class="btns"><button class="btn" onclick="saveInvSite('${id}')">저장</button>
   ${i.kind === '매출' && !c.cancelled.has(i.id) ? (c.paidBy[i.id] ? (c.paidBy[i.id].manual ? `<button class="btn ghost" onclick="togglePaid('${id}',false)">미입금으로 되돌리기</button>` : '') : `<button class="btn grn" onclick="togglePaid('${id}',true)">입금 확인 처리</button>`) : ''}
   <button class="btn ghost" onclick="closeSheet()">닫기</button></div>`);
 }
@@ -463,8 +482,9 @@ function viewAR() {
   const unmatched = DB.deposits.filter(d => !(d.invIds || []).length && !d.ignore).sort((a, b) => b.date.localeCompare(a.date));
   return `<div class="card"><h3>미수금 합계 <span class="red">${won(sum)}원</span></h3>
   <div class="note">${DB.settings.arStart} 이후 발행한 매출 계산서 중 통장 입금이 확인되지 않은 건 (부가세 포함 합계금액). 기준일은 설정에서 바꿀 수 있습니다.</div>
-  <div class="btns"><button class="btn" onclick="importBank()">통장 거래내역 올리기</button><button class="btn ghost" onclick="depositForm()">입금 직접 입력</button></div></div>
-  ${Object.values(groups).sort((a, b) => b.sum - a.sum).map(g => `<div class="card"><h3>${esc(g.name)} <span>${won(g.sum)}원</span></h3>
+  <div class="btns"><button class="btn" onclick="smsSheet()">입금 문자 붙여넣기</button><button class="btn ghost" onclick="importBank()">통장 거래내역 파일</button><button class="btn ghost" onclick="depositForm()">입금 직접 입력</button></div></div>
+  ${prepaidCard()}
+  ${Object.values(groups).sort((a, b) => b.sum - a.sum).map(g => `<div class="card"><h3>${esc(g.name)} <span>${won(g.sum)}원 ${g.list.some(x => x.age > 30) ? `<button class="btn sm ghost" onclick="dunMail('${esc(g.list[0].inv.bizNo || g.list[0].inv.name)}')">입금 요청 메일</button>` : ''}</span></h3>
     ${g.list.map(x => row(esc(x.inv.item), `${x.inv.date} · ${x.age}일 지남`, `${won(x.inv.total)}${x.age > 60 ? '<br><span class="badge red">60일+</span>' : x.age > 30 ? '<br><span class="badge org">30일+</span>' : ''}`, `onclick="invDetail('${x.inv.id}')"`)).join('')}</div>`).join('') || '<div class="card"><div class="empty">미수금이 없습니다 👍</div></div>'}
   <div class="card"><h3>계산서와 못 맞춘 입금 ${unmatched.length}건</h3>
   ${unmatched.slice(0, 50).map(d => row(esc(d.name), `${d.date}${d.memo ? ' · ' + esc(d.memo) : ''}`, won(d.amount), `onclick="matchDeposit('${d.id}')"`)).join('') || '<div class="empty">없음</div>'}
@@ -478,16 +498,17 @@ function depositForm() {
 function matchDeposit(id) {
   const d = DB.deposits.find(x => x.id === id); const ar = receivables().map(x => x.inv);
   const linked = DB.invoices.filter(i => (d.invIds || []).includes(i.id));
-  const cands = [...linked, ...ar.filter(i => i.date <= d.date)].slice(0, 80);
+  const cands = [...linked, ...ar.filter(i => !linked.includes(i) && (i.date <= d.date || d.prepaid))].slice(0, 80);
   const n = normName(d.name); cands.sort((a, b) => (normName(b.name).includes(n) || n.includes(normName(b.name))) - (normName(a.name).includes(n) || n.includes(normName(a.name))));
   openSheet(`<h2>입금 연결</h2><div class="kv"><div>입금</div><div>${d.date} · ${esc(d.name)} · <b>${won(d.amount)}</b>원</div></div>
-  <p class="note">이 입금으로 받은 계산서를 체크하세요. 선택 합계: <b id="selSum">0</b>원</p>
+  <p class="note">이 입금으로 받은 계산서를 모두 체크하세요(여러 달을 한 번에 받았으면 여러 건). 선택 합계: <b id="selSum">0</b>원 · 차액 <b id="selDiff">0</b>원</p>
+  <label class="f"><input class="chk" type="checkbox" id="depPrepaid" ${d.prepaid ? 'checked' : ''}>남는 금액은 선입금으로 두고, 같은 거래처 다음 계산서가 발행되면 자동 연결</label>
   <div id="cands">${cands.map(i => `<label class="row" style="cursor:pointer"><div class="l"><input class="chk" type="checkbox" value="${i.id}" data-t="${i.total}" ${(d.invIds || []).includes(i.id) ? 'checked' : ''}><b style="display:inline">${esc(i.name)}</b><small>${i.date} · ${esc(i.item)}</small></div><div class="r">${won(i.total)}</div></label>`).join('') || '<div class="empty">미수 계산서가 없습니다</div>'}</div>
   <div class="btns"><button class="btn" onclick="saveMatch('${id}')">저장</button><button class="btn ghost" onclick="ignoreDep('${id}')">무시(계산서 아님)</button><button class="btn red" onclick="delDep('${id}')">삭제</button><button class="btn ghost" onclick="closeSheet()">닫기</button></div>`);
-  const upd = () => { $('#selSum').textContent = won([...document.querySelectorAll('#cands input:checked')].reduce((a, x) => a + Number(x.dataset.t), 0)); };
+  const upd = () => { const sum = [...document.querySelectorAll('#cands input:checked')].reduce((a, x) => a + Number(x.dataset.t), 0); $('#selSum').textContent = won(sum); $('#selDiff').textContent = won(d.amount - sum); };
   document.querySelectorAll('#cands input').forEach(x => x.onchange = upd); upd();
 }
-async function saveMatch(id) { const d = DB.deposits.find(x => x.id === id); d.invIds = [...document.querySelectorAll('#cands input:checked')].map(x => x.value); d.ignore = false; closeSheet(); await save(); render(); }
+async function saveMatch(id) { const d = DB.deposits.find(x => x.id === id); d.invIds = [...document.querySelectorAll('#cands input:checked')].map(x => x.value); d.ignore = false; d.prepaid = $('#depPrepaid').checked; if (d.prepaid) d.payer = d.payer || (DB.invoices.find(i => i.id === d.invIds[0]) || {}).bizNo || ''; closeSheet(); invalidate(); applyPrepaid(); await save(); render(); }
 async function ignoreDep(id) { const d = DB.deposits.find(x => x.id === id); d.ignore = true; d.invIds = []; closeSheet(); await save(); render(); }
 async function delDep(id) { if (!confirm('입금 내역을 삭제할까요?')) return; DB.deposits = DB.deposits.filter(x => x.id !== id); closeSheet(); await save(); render(); }
 // 자동 대조: 금액이 같은 계산서 1건, 아니면 같은 거래처의 여러 건 합계가 같은 조합
@@ -592,7 +613,7 @@ async function importHometax() {
       }
     }
     if (!seen) { alert('승인번호·공급가액 열을 찾지 못했습니다. 홈택스 목록조회 엑셀/CSV인지 확인해 주세요.'); return; }
-    await save(); render(); toast(`${seen}건 중 새 계산서 ${added}건 추가`);
+    invalidate(); const rq = reconcileBillReqs(); applyPrepaid(); await save(); render(); toast(`${seen}건 중 새 계산서 ${added}건 추가${rq ? `, 발행요청 ${rq}건 발행 완료로 표시` : ''}`);
   } catch (e) { console.error(e); alert('파일을 읽지 못했습니다: ' + e.message); }
 }
 async function importBank() {
@@ -634,7 +655,11 @@ function viewSettings() {
   <label class="f">비밀번호 (Apps Script에 정한 값)<input id="stTok" type="password" value="${esc(s.syncToken)}"></label>
   <div class="btns"><button class="btn" onclick="saveSettings()">저장</button><button class="btn grn" onclick="syncPush()">시트로 올리기</button><button class="btn ghost" onclick="syncPull()">시트에서 받기</button><button class="btn ghost" onclick="pullInbox()">메일 업무 받기</button></div>
   <div class="note">마지막 저장: ${DB.updated ? new Date(DB.updated).toLocaleString('ko-KR') : '-'}${s.lastSync ? ' · 마지막 동기화: ' + new Date(s.lastSync).toLocaleString('ko-KR') : ''}</div></div>
+  <div class="card"><h3>구글 캘린더 자동 등록</h3><label class="f"><input class="chk" type="checkbox" id="stCal" ${s.calSync === false ? '' : 'checked'} onchange="DB.settings.calSync=this.checked;save()">점검 예정일·발주 납기·앞으로의 작업 기록을 구글 캘린더에 올리기</label>
+  <div class="note">구글 시트로 올릴 때 함께 보내고, Apps Script가 기본 캘린더에 일정을 만들거나 고칩니다. 점검을 끝내면 남은 예정 일정은 지워집니다. (Apps Script를 새 버전으로 배포해야 동작)</div></div>
+  ${logCard()}
   <div class="card"><h3>백업</h3><div class="btns"><button class="btn ghost" onclick="exportJSON()">백업 파일 저장</button><button class="btn ghost" onclick="importJSON()">백업·초기 데이터 불러오기</button><button class="btn red" onclick="resetAll()">전체 초기화</button></div>
+  <div class="note">구글 시트에 연결돼 있으면 하루 한 번 시트 안에 백업본(_bak_날짜)이 자동으로 남습니다(최근 14개).</div>
   <div class="note">사이트 ${DB.sites.length} · 계산서 ${DB.invoices.length} · 작업기록 ${DB.events.length} · 부품 ${DB.parts.length} · 입금 ${DB.deposits.length}</div></div>`;
 }
 async function saveSettings() { const s = DB.settings, wasReady = syncReady(); s.company = $('#stCompany').value.trim(); s.bizNo = $('#stBiz').value.trim(); s.arStart = $('#stAr').value || '2000-01-01'; s.syncUrl = $('#stUrl').value.trim(); s.owner = $('#stOwner').value.trim(); s.tel = $('#stTel').value.trim(); s.email = $('#stEmail').value.trim(); s.address = $('#stAddr').value.trim(); s.syncToken = $('#stTok').value;
@@ -645,7 +670,7 @@ async function importJSON() {
   const f = await pickFile('.json'); if (!f) return;
   try { const d = JSON.parse(await f.text()); if (!d.sites || !d.invoices) throw new Error('형식이 다릅니다');
     if (DB.sites.length && !confirm('지금 자료를 이 파일 내용으로 바꿀까요?')) return;
-    DB = Object.assign(blankDB(), d); DB.settings = Object.assign(blankDB().settings, d.settings || {}); await save(); render(); toast('불러왔습니다');
+    DB = Object.assign(blankDB(), d); DB.settings = Object.assign(blankDB().settings, d.settings || {}); _snap = null; await save(); render(); toast('불러왔습니다');
   } catch (e) { alert('불러오기 실패: ' + e.message); }
 }
 async function resetAll() { if (!confirm('모든 자료를 지울까요? (먼저 백업을 저장하세요)')) return; const st = DB.settings; DB = blankDB(); DB.settings.syncUrl = st.syncUrl; DB.settings.syncToken = st.syncToken; await save(); render(); }
@@ -658,7 +683,7 @@ async function syncPull() {
   try { toast('받는 중…'); const r = await fetch(s.syncUrl + (s.syncUrl.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(s.syncToken)); const j = await r.json(); if (!j.ok) throw new Error(j.error || '실패');
     if (!j.data) { toast('시트에 저장된 자료가 없습니다'); return; }
     if (!confirm(`시트 자료(${j.data.updated ? new Date(j.data.updated).toLocaleString('ko-KR') : ''})로 이 기기 자료를 바꿀까요?`)) return;
-    const keep = { syncUrl: s.syncUrl, syncToken: s.syncToken }; DB = Object.assign(blankDB(), j.data); if (!DB.updated) DB.updated = new Date().toISOString(); DB.settings = Object.assign(blankDB().settings, j.data.settings, keep, { lastSync: DB.updated });
+    const keep = { syncUrl: s.syncUrl, syncToken: s.syncToken }; DB = Object.assign(blankDB(), j.data); if (!DB.updated) DB.updated = new Date().toISOString(); DB.settings = Object.assign(blankDB().settings, j.data.settings, keep, { lastSync: DB.updated }); _snap = null; diffLog();
     await persist(); syncBadge(); toast('받았습니다'); render(); await pullInbox(true); } catch (e) { alert('동기화 실패: ' + e.message); }
 }
 
@@ -701,7 +726,7 @@ function orderForm(o) {
     { k: 'amount', label: '금액 (공급가액)', type: 'number', value: o.amount }, { k: 'dueDate', label: '납기·작업일', type: 'date', value: o.dueDate },
     { k: 'summary', label: '내용', type: 'textarea', value: o.summary }, { k: 'contact', label: '담당자', value: o.contact },
   ], v => { if (!v.title) { toast('건명을 입력하세요'); return false; } if (isNew) DB.orders.push({ id: uid('o'), source: 'manual', ...v }); else Object.assign(o, v); toast('저장했습니다'); },
-    (o.mailUrl ? `<a class="btn ghost" target="_blank" href="${esc(o.mailUrl)}">메일 보기</a>` : '') + (isNew ? '' : (o.kind === '견적요청' ? `<button class="btn grn" type="button" onclick="quoteFromOrder('${o.id}')">견적서 작성</button>` : '') + `<button class="btn ghost" type="button" onclick="orderToEvent('${o.id}')">작업 기록으로</button><button class="btn red" type="button" onclick="delOrder('${o.id}')">삭제</button>`));
+    (o.mailUrl ? `<a class="btn ghost" target="_blank" href="${esc(o.mailUrl)}">메일 보기</a>` : '') + (isNew ? '' : (o.kind === '견적요청' ? `<button class="btn grn" type="button" onclick="quoteFromOrder('${o.id}')">견적서 작성</button>` : '') + (['발주', '장애·점검요청', '견적요청'].includes(o.kind) ? `<button class="btn ghost" type="button" onclick="closeSheet();billPrep({orderId:'${o.id}'})">계산서 발행 준비</button>` : '') + `<button class="btn ghost" type="button" onclick="orderToEvent('${o.id}')">작업 기록으로</button><button class="btn red" type="button" onclick="delOrder('${o.id}')">삭제</button>`));
 }
 async function delOrder(id) { if (!confirm('삭제할까요?')) return; DB.orders = DB.orders.filter(x => x.id !== id); closeSheet(); await save(); render(); }
 function orderToEvent(id) { const o = DB.orders.find(x => x.id === id); closeSheet(); eventForm({ siteId: o.siteId, date: todayStr(), type: o.kind === '장애·점검요청' ? '장애처리' : '기술지원', title: o.title, memo: o.summary }); }
@@ -770,8 +795,8 @@ function viewQuotes() {
   const list = (DB.quotes || []).slice().sort((a, b) => b.date.localeCompare(a.date) || (b.no || '').localeCompare(a.no || ''));
   return `<div class="btns"><button class="btn" onclick="quoteEdit()">+ 새 견적서</button></div>
   <div class="card"><h3>견적서 ${list.length}건 <span class="sub" style="font-size:12px;font-weight:400">수주 ${won(list.filter(q => q.status === '수주').reduce((a, q) => a + quoteTotals(q).sup, 0))}원</span></h3>
-  ${list.map(q => row(`${esc(q.title || '(건명 없음)')} <span class="badge ${q.status === '수주' ? 'grn' : q.status === '발송' ? 'blue' : q.status === '실주' ? '' : 'org'}">${esc(q.status)}</span>`, `${q.date} · ${esc(q.to)}${q.no ? ' · ' + esc(q.no) : ''}`, won(quoteTotals(q).sup), `onclick="quoteEdit('${q.id}')"`)).join('') || '<div class="empty">아직 견적서가 없습니다</div>'}</div>
-  <div class="note">견적서를 작성하고 “PDF 저장/인쇄”를 누르면 이포트텍 양식으로 출력됩니다. 인쇄 창에서 대상을 “PDF로 저장”으로 고르면 파일이 됩니다.</div>`;
+  ${list.map(q => row(`${esc(q.title || '(건명 없음)')} <span class="badge ${q.status === '수주' ? 'grn' : q.status === '발송' ? 'blue' : q.status === '실주' ? '' : 'org'}">${esc(q.status)}</span>${q.invId ? ' <span class="badge grn">계산서</span>' : pendingReqs().some(r => r.quoteId === q.id) ? ' <span class="badge blue">발행요청</span>' : ''}`, `${q.date} · ${esc(q.to)}${q.no ? ' · ' + esc(q.no) : ''}`, won(quoteTotals(q).sup), `onclick="quoteEdit('${q.id}')"`)).join('') || '<div class="empty">아직 견적서가 없습니다</div>'}</div>
+  <div class="note">발주서 없이 진행하는 건은 견적서를 열어 <b>계산서 발행 준비</b>를 누르면 견적 금액·건명으로 바로 발행요청이 만들어집니다(견적은 수주로 바뀜). 견적서를 작성하고 “PDF 저장/인쇄”를 누르면 이포트텍 양식으로 출력됩니다. 인쇄 창에서 대상을 “PDF로 저장”으로 고르면 파일이 됩니다.</div>`;
 }
 let QD = null; // 편집 중인 견적서
 function quoteEdit(id, preset) {
@@ -797,7 +822,7 @@ function renderQuoteSheet() {
   <div class="btns"><button class="btn sm ghost" type="button" onclick="quoteItem(-1,1)">+ 품목 추가</button></div>
   <div class="kv" style="margin:8px 0"><div>공급가액</div><div><b id="qSup">${won(t.sup)}</b>원</div><div>부가세</div><div id="qVat">${won(t.vat)}원</div><div>합계</div><div id="qTot">${won(t.tot)}원</div></div>
   <label class="f">견적 조건 <span style="float:right">${Object.keys(QUOTE_TEMPLATES).map(k => `<a href="javascript:quoteTpl('${k}')" style="margin-left:8px">${k}</a>`).join('')}</span><textarea data-q="conditions" style="min-height:140px">${esc(q.conditions)}</textarea></label>
-  <div class="btns"><button class="btn" onclick="quoteSave()">저장</button><button class="btn grn" onclick="quoteSave(true)">PDF 저장/인쇄</button>${q.id ? `<button class="btn ghost" onclick="quoteMail()">메일 쓰기</button><button class="btn ghost" onclick="quoteCopy()">복사해서 새로</button>${q.status === '수주' ? '' : `<button class="btn ghost" onclick="quoteWon()">수주 처리</button>`}<button class="btn red" onclick="quoteDel()">삭제</button>` : ''}<button class="btn ghost" onclick="closeSheet()">닫기</button></div>`);
+  <div class="btns"><button class="btn" onclick="quoteSave()">저장</button><button class="btn grn" onclick="quoteSave(true)">PDF 저장/인쇄</button>${q.id ? `<button class="btn ghost" onclick="quoteMail()">메일 쓰기</button><button class="btn ghost" onclick="quoteCopy()">복사해서 새로</button>${q.status === '수주' ? '' : `<button class="btn ghost" onclick="quoteWon()">수주 처리</button>`}${q.invId ? '' : `<button class="btn grn" onclick="closeSheet();billPrep({quoteId:'${q.id}'})">계산서 발행 준비</button>`}<button class="btn red" onclick="quoteDel()">삭제</button>` : ''}<button class="btn ghost" onclick="closeSheet()">닫기</button></div>`);
   document.querySelectorAll('#sheet [data-q]').forEach(el => el.oninput = el.onchange = () => { QD[el.dataset.q] = el.type === 'number' ? Number(el.value) : el.value; });
   document.querySelectorAll('#sheet [data-i]').forEach(el => el.oninput = () => {
     const it = QD.items[el.dataset.i], k = el.dataset.k;
@@ -819,7 +844,9 @@ function quoteCopy() { const c = JSON.parse(JSON.stringify(QD)); delete c.id; de
 async function quoteWon() {
   const q = DB.quotes.find(x => x.id === QD.id); q.status = '수주';
   DB.orders.push({ id: uid('o'), source: 'quote', quoteId: q.id, date: todayStr(), kind: '발주', status: '접수', title: q.title, client: q.to, customer: '', amount: quoteTotals(q).sup, summary: `견적서 ${q.no} 수주`, contact: q.attn });
-  closeSheet(); await save(); render(); toast('수주 처리하고 발주 목록에 넣었습니다');
+  closeSheet(); await save(); render();
+  if (/유지보수|유지관리/.test((q.title || '') + (q.conditions || ''))) { siteForm(siteFromQuote(q)); toast('수주 처리했습니다. 유지보수 사이트로 등록할 내용을 확인하고 저장하세요'); }
+  else toast('수주 처리하고 발주 목록에 넣었습니다');
 }
 function quoteMail() {
   const q = QD, t = quoteTotals(q), s = DB.settings;
@@ -866,24 +893,348 @@ function quoteFromOrder(id) {
     items: [{ maker: '', model: site && site.equipment ? site.equipment : '', qty: 1, period: '', unit: 0, amount: 0, note: '' }] });
 }
 
+/* ---------------- 계산서 발행 준비 · 발행요청 (클로드가 홈택스에 채워 둠, 서명은 직접) ---------------- */
+const pendingReqs = () => (DB.billReqs || []).filter(r => r.status === '요청');
+const reqFor = (siteId, ym) => pendingReqs().find(r => r.siteId === siteId && r.ym === ym);
+const monthsBetween = (a, b) => { const [y1, m1] = a.split('-').map(Number), [y2, m2] = b.split('-').map(Number); return (y2 - y1) * 12 + (m2 - m1); };
+// 품목명: 사이트의 "품목명 틀"이 있으면 그것, 없으면 지난 계산서 품목명에서 달(N월, N~M월, N분기)만 바꿈
+function billItemFor(site, ym) {
+  const m = Number(ym.slice(5)), y = ym.slice(0, 4);
+  if (site.itemTpl) return site.itemTpl.replace(/\{사이트\}/g, site.name).replace(/\{0월\}/g, String(m).padStart(2, '0')).replace(/\{월\}/g, String(m)).replace(/\{년\}/g, y).replace(/\{분기\}/g, String(Math.ceil(m / 3)));
+  const c = calc(); const list = (c.bySite[site.id] || []).filter(i => i.supply > 0 && !c.cancelled.has(i.id)).sort((a, b) => b.date.localeCompare(a.date));
+  const last = list[0]; if (!last) return `${site.name} ${m}월 유지보수`;
+  const k = monthsBetween(c.period[last.id] || ymOf(last.date), ym); if (!k) return last.item;
+  const sh = (n) => { const v = ((Number(n) - 1 + k) % 12 + 12) % 12 + 1; return /^0\d/.test(n) ? String(v).padStart(2, '0') : String(v); };
+  let t = last.item.replace(/(\d{1,2})(\s*[~\-]\s*)(\d{1,2})(\s*월)/g, (a, p, s1, q, w) => sh(p) + s1 + sh(q) + w);
+  if (t === last.item) t = t.replace(/(\d{1,2}(?:\s*,\s*\d{1,2})+)(\s*월)/g, (a, list, w) => list.replace(/\d{1,2}/g, sh) + w);
+  if (t === last.item) t = t.replace(/(^|[^0-9])(\d{1,2})(\s*월)(?!\s*\d+\s*일)/g, (a, pre, n, w) => Number(n) >= 1 && Number(n) <= 12 ? pre + sh(n) + w : a);
+  const kq = Math.round(k / 3); if (kq) t = t.replace(/([1-4])(\s*분기)/g, (a, n, w) => String(((Number(n) - 1 + kq) % 4 + 4) % 4 + 1) + w);
+  t = t.replace(/20\d\d(\s*년)/g, y + '$1');
+  return t;
+}
+function lookupBizNo(name) {
+  if (!name) return ''; const n = normName(name);
+  const ct = (DB.contacts || []).find(x => normName(x.name) === n || (n.length >= 2 && normName(x.name).includes(n))); if (ct && ct.bizNo) return ct.bizNo;
+  const iv = DB.invoices.filter(i => normName(i.name) === n || (n.length >= 3 && normName(i.name).includes(n))).sort((a, b) => b.date.localeCompare(a.date))[0];
+  return iv ? iv.bizNo : '';
+}
+const contactOf = (bizNo, name) => (DB.contacts || []).find(x => (bizNo && x.bizNo === bizNo) || (!bizNo && name && normName(x.name) === normName(name))) || null;
+function billPrep(p) {
+  p = p || {}; DB.billReqs = DB.billReqs || [];
+  let r = p.id ? DB.billReqs.find(x => x.id === p.id) : null;
+  if (!r && p.siteId) r = reqFor(p.siteId, p.ym || ymOf(todayStr()));
+  const isNew = !r;
+  if (isNew) {
+    r = { date: todayStr(), bizNo: '', name: '', item: '', supply: 0, memo: '', recv: '청구' };
+    if (p.siteId) { const s = DB.sites.find(x => x.id === p.siteId); const ym = p.ym || ymOf(todayStr()); Object.assign(r, { siteId: s.id, ym, bizNo: s.bizNo || lookupBizNo(s.client), name: s.client, item: isAdhoc(s) ? `${s.name} 기술지원` : billItemFor(s, ym), supply: s.amount || 0 }); }
+    if (p.orderId) { const o = DB.orders.find(x => x.id === p.orderId); const q = (DB.quotes || []).find(x => x.orderId === o.id || x.id === o.quoteId);
+      Object.assign(r, { orderId: o.id, quoteId: q ? q.id : '', siteId: o.siteId || '', name: o.client || (q ? q.to : ''), bizNo: lookupBizNo(o.client || (q ? q.to : '')), item: o.title || (q ? q.title : ''), supply: o.amount || (q ? quoteTotals(q).sup : 0) }); }
+    if (p.quoteId) { const q = DB.quotes.find(x => x.id === p.quoteId); Object.assign(r, { quoteId: q.id, orderId: q.orderId || '', name: q.to || '', bizNo: lookupBizNo(q.to), item: q.title || '', supply: quoteTotals(q).sup }); }
+    const ct = contactOf(r.bizNo, r.name); if (ct && ct.taxEmail) r.memo = '수신 ' + ct.taxEmail;
+  }
+  formSheet(isNew ? '계산서 발행 준비' : '발행요청 수정', [
+    { k: 'date', label: '작성일자', type: 'date', value: r.date },
+    { k: 'name', label: '공급받는자 (거래처)', value: r.name },
+    { k: 'bizNo', label: '사업자번호', value: r.bizNo, ph: '000-00-00000' },
+    { k: 'itemName', label: '품목명', value: r.item },
+    { k: 'supply', label: '공급가액 (부가세 10%는 자동)', type: 'number', value: r.supply },
+    { k: 'recv', label: '영수/청구', type: 'select', options: ['청구', '영수'], value: r.recv || '청구' },
+    { k: 'memo', label: '메모 (수신 메일 등, 클로드가 참고)', value: r.memo },
+  ], o => {
+    o.item = o.itemName; delete o.itemName;
+    if (!o.name || !o.supply) { toast('거래처와 공급가액을 입력하세요'); return false; }
+    if (!o.bizNo) o.bizNo = lookupBizNo(o.name);
+    if (!/^\d{3}-?\d{2}-?\d{5}$/.test(o.bizNo || '')) { toast('사업자번호를 확인하세요 (000-00-00000)'); return false; }
+    o.bizNo = o.bizNo.replace(/^(\d{3})-?(\d{2})-?(\d{5})$/, '$1-$2-$3'); o.tax = Math.round(o.supply * 0.1); o.total = o.supply + o.tax;
+    if (isNew) DB.billReqs.push({ id: uid('r'), status: '요청', created: new Date().toISOString(), siteId: r.siteId || '', ym: r.ym || '', orderId: r.orderId || '', quoteId: r.quoteId || '', ...o });
+    // 견적 → 바로 계산서: 발주 없이 진행하는 건은 견적을 수주로, 연결된 요청은 완료로
+    const q = r.quoteId && DB.quotes.find(x => x.id === r.quoteId); if (q && ['작성', '발송'].includes(q.status)) q.status = '수주';
+    const od = r.orderId && DB.orders.find(x => x.id === r.orderId); if (od && ['접수', '진행'].includes(od.status)) od.status = '완료';
+    else Object.assign(r, o);
+    toast('발행요청에 넣었습니다. 클로드에게 “발행요청 처리”라고 하면 홈택스에 채워 둡니다');
+  }, `<button class="btn ghost" type="button" onclick="reqCopyForm()">글로 복사</button>${isNew ? '' : `<button class="btn red" type="button" onclick="reqCancel('${r.id}')">요청 취소</button>`}`);
+}
+function reqText(r) { return `${r.date} ${r.name} (${r.bizNo}) / ${r.item} / 공급가 ${won(r.supply)} + 세액 ${won(Math.round(r.supply * 0.1))} = ${won(r.supply + Math.round(r.supply * 0.1))}원 (${r.recv || '청구'})${r.memo ? ' / ' + r.memo : ''}`; }
+function copyText(t) { (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(() => toast('복사했습니다'), () => { prompt('복사하세요', t); }); }
+function reqCopyForm() { const f = $('#fm').elements; copyText(reqText({ date: f.date.value, name: f.name.value, bizNo: f.bizNo.value, item: f.itemName.value, supply: toNum(f.supply.value), recv: f.recv.value, memo: f.memo.value })); }
+async function reqCancel(id) { const r = DB.billReqs.find(x => x.id === id); r.status = '취소'; closeSheet(); await save(); render(); toast('요청을 취소했습니다'); }
+async function billPrepAll(ym) {
+  const st = billingStatus(ym).filter(x => !x.done && !reqFor(x.site.id, ym)); DB.billReqs = DB.billReqs || [];
+  for (const x of st) { const s = x.site; const ct = contactOf(s.bizNo, s.client); const sup = s.amount || 0;
+    DB.billReqs.push({ id: uid('r'), status: '요청', created: new Date().toISOString(), siteId: s.id, ym, orderId: '', date: todayStr(), name: s.client, bizNo: s.bizNo || lookupBizNo(s.client), item: billItemFor(s, ym), supply: sup, tax: Math.round(sup * 0.1), total: sup + Math.round(sup * 0.1), recv: '청구', memo: ct && ct.taxEmail ? '수신 ' + ct.taxEmail : '' }); }
+  await save(); render(); toast(`${st.length}건을 발행요청에 넣었습니다`);
+}
+function reqView() {
+  const pend = pendingReqs().sort((a, b) => a.date.localeCompare(b.date)), done = (DB.billReqs || []).filter(r => r.status !== '요청').sort((a, b) => (b.doneAt || b.created || '').localeCompare(a.doneAt || a.created || '')).slice(0, 20);
+  const sum = pend.reduce((a, r) => a + r.supply, 0);
+  return `<div class="card"><h3>발행 대기 ${pend.length}건 <span class="sub" style="font-size:12px;font-weight:400">공급가 ${won(sum)}원</span></h3>
+  ${pend.map(r => row(`${esc(r.item)}`, `${r.date} · ${esc(r.name)} ${esc(r.bizNo)}${r.memo ? ' · ' + esc(r.memo) : ''}`, `${won(r.supply)}<br><small class="sub">+세 ${won(Math.round(r.supply * 0.1))}</small>`, `onclick="billPrep({id:'${r.id}'})"`)).join('') || '<div class="empty">대기 중인 발행요청이 없습니다</div>'}
+  <div class="btns"><button class="btn ghost" onclick="billPrep({})">+ 발행 준비</button>${pend.length ? `<button class="btn ghost" onclick="copyText(pendingReqs().map(reqText).join('\\n'))">모두 글로 복사</button>` : ''}</div>
+  <div class="note">클로드에게 <b>“발행요청 처리”</b>라고 하면 이 목록을 읽어 홈택스 건별발급 화면에 채우고 “인증 요청” 직전까지 준비합니다. 휴대폰에서 승인(서명)하시면 발급되고, 승인번호를 읽어 계산서 목록에 넣은 뒤 여기서 ‘발행’으로 바뀝니다. 홈택스 파일을 올려도 같은 거래처·금액 계산서가 있으면 자동으로 ‘발행’ 처리됩니다.</div></div>
+  ${done.length ? `<div class="card"><h3>최근 처리</h3>${done.map(r => row(`${esc(r.item)} <span class="badge ${r.status === '발행' ? 'grn' : ''}">${esc(r.status)}</span>`, `${r.date} · ${esc(r.name)}${r.invId ? ' · ' + esc(r.invId) : ''}`, won(r.supply), r.invId ? `onclick="invDetail('${r.invId}')"` : '')).join('')}</div>` : ''}`;
+}
+// 발행요청 ↔ 실제 계산서: 같은 사업자번호·공급가액, 요청 작성일 7일 전 이후 계산서면 발행 완료로 표시
+function reconcileBillReqs() {
+  let n = 0; const used = new Set((DB.billReqs || []).filter(r => r.invId).map(r => r.invId));
+  for (const r of pendingReqs()) {
+    const from = (() => { const d = new Date(r.date); d.setDate(d.getDate() - 7); return d.toISOString().slice(0, 10); })();
+    const cands = DB.invoices.filter(i => i.kind === '매출' && !used.has(i.id) && i.bizNo === r.bizNo && i.supply === r.supply && i.date >= from);
+    const inv = cands.find(i => i.item.replace(/\s/g, '') === String(r.item).replace(/\s/g, '')) || (cands.length === 1 ? cands[0] : null);
+    if (inv) { r.status = '발행'; r.invId = inv.id; r.doneAt = new Date().toISOString(); used.add(inv.id); n++;
+      if (r.siteId && !inv.siteId) { const s = siteForInvoice(inv); if (!s || s.id !== r.siteId) inv.siteId = r.siteId; }
+      if (r.orderId) { const o = DB.orders.find(x => x.id === r.orderId); if (o && o.status !== '취소') o.status = '계산서발행'; }
+      if (r.quoteId) { const q = DB.quotes.find(x => x.id === r.quoteId); if (q) { q.status = '수주'; q.invId = inv.id; } } }
+  }
+  if (n) invalidate(); return n;
+}
+// 선입금: 남은 금액이 있으면 같은 거래처의 새 계산서(오래된 것부터)를 자동 연결
+function applyPrepaid() {
+  let n = 0;
+  for (const d of DB.deposits.filter(x => x.prepaid)) {
+    invalidate(); let credit = calc().credit[d.id] || 0; if (credit <= 0) continue;
+    const biz = d.payer || (DB.invoices.find(i => i.id === (d.invIds || [])[0]) || {}).bizNo;
+    const open = receivables().map(x => x.inv).filter(i => (biz ? i.bizNo === biz : normName(i.name).includes(normName(d.name))) && i.total <= credit).sort((a, b) => a.date.localeCompare(b.date));
+    for (const i of open) { if (i.total > credit) continue; d.invIds = [...(d.invIds || []), i.id]; credit -= i.total; n++; }
+  }
+  invalidate(); return n;
+}
+let _recBusy = false;
+function autoReconcile() { if (_recBusy || !DB) return 0; _recBusy = true; try { return (pendingReqs().length ? reconcileBillReqs() : 0) + (DB.deposits.some(d => d.prepaid) ? applyPrepaid() : 0); } finally { _recBusy = false; } }
+function prepaidCard() {
+  const c = calc(); const l = DB.deposits.filter(d => d.prepaid && (c.credit[d.id] || 0) > 0);
+  return l.length ? `<div class="card"><h3>선입금 잔액 ${l.length}건 <span>${won(l.reduce((a, d) => a + c.credit[d.id], 0))}원</span></h3>${l.map(d => row(esc(d.name), `${d.date} 입금 ${won(d.amount)} · 연결 ${(d.invIds || []).length}건`, won(c.credit[d.id]), `onclick="matchDeposit('${d.id}')"`)).join('')}<div class="note">같은 거래처 계산서가 새로 발행되면 자동으로 연결됩니다.</div></div>` : '';
+}
+
+/* ---------------- 홈: 오늘 할 일 · 미수 알림 · 보증 만료 ---------------- */
+function todoList() {
+  const ym = ymOf(todayStr()), bill = billingStatus(ym).filter(x => !x.done), noReq = bill.filter(x => !reqFor(x.site.id, ym));
+  const late = inspectStatus(ym).filter(x => x.late), ar60 = receivables().filter(x => x.age > 60), ar30 = receivables().filter(x => x.age > 30 && x.age <= 60);
+  const wr = warrantySoon(), low = DB.parts.filter(p => (p.qty || 0) <= (p.minQty || 0) && (p.minQty || 0) > 0), pend = pendingReqs();
+  const t = [];
+  if (noReq.length) t.push(['🧾', `${Number(ym.slice(5))}월 계산서 미발행 ${noReq.length}건 (${man(noReq.reduce((a, x) => a + x.site.amount, 0))}원)`, '#invoices/month', 'org']);
+  if (pend.length) t.push(['✍', `발행요청 ${pend.length}건 서명 대기`, '#invoices/req', 'blue']);
+  if (late.length) t.push(['📅', `예정일 지난 미점검 ${late.length}곳`, '#schedule', 'red']);
+  if (ar60.length) t.push(['💰', `60일 넘은 미수금 ${ar60.length}건 (${man(ar60.reduce((a, x) => a + x.inv.total, 0))}원)`, '#ar', 'red']);
+  if (ar30.length) t.push(['💰', `30일 넘은 미수금 ${ar30.length}건`, '#ar', 'org']);
+  if (wr.length) t.push(['🛡', `장비 보증 만료 임박 ${wr.length}대`, '#sites', 'org']);
+  if (low.length) t.push(['📦', `재고 부족 ${low.length}품목`, '#parts', 'org']);
+  return t;
+}
+function todayCard() {
+  const t = todoList();
+  return `<div class="card today"><h3>오늘 할 일 <span class="sub" style="font-size:12px;font-weight:400">${todayStr().slice(5).replace('-', '/')}</span></h3>${t.map(([i, txt, h, cl]) => `<div class="row click" onclick="go('${h}')"><div class="l"><b><span style="margin-right:6px">${i}</span><span class="${cl}">${esc(txt)}</span></b></div><div class="r sub">›</div></div>`).join('') || '<div class="empty">할 일이 없습니다 👍</div>'}</div>`;
+}
+function setBadge() { try { const n = todoList().length; if (navigator.setAppBadge) n ? navigator.setAppBadge(n) : navigator.clearAppBadge(); } catch (e) { } }
+function dunCard() {
+  const ar = receivables().filter(x => x.age > 30); if (!ar.length) return '';
+  const g = {}; for (const x of ar) { const k = x.inv.bizNo || x.inv.name; const o = g[k] = g[k] || { k, name: x.inv.name, n: 0, sum: 0, age: 0 }; o.n++; o.sum += x.inv.total; o.age = Math.max(o.age, x.age); }
+  const l = Object.values(g).sort((a, b) => b.age - a.age);
+  return `<div class="card" style="margin-top:12px;border-left:4px solid var(--red)"><h3>입금 확인 필요 (30일+) <a href="#ar">미수금</a></h3>${l.map(x => { const dn = (DB.dunning || {})[x.k]; return row(`${esc(x.name)} <span class="badge ${x.age > 60 ? 'red' : 'org'}">${x.age}일</span>`, `${x.n}건${dn ? ' · 요청 메일 ' + dn.slice(5) : ''}`, `${won(x.sum)}<br><button class="btn sm ghost" onclick="event.stopPropagation();dunMail('${esc(x.k)}')">입금 요청</button>`, `onclick="go('#client/${encodeURIComponent(x.k)}')"`); }).join('')}</div>`;
+}
+async function dunMail(key) {
+  const ar = receivables().filter(x => (x.inv.bizNo || x.inv.name) === key); if (!ar.length) return;
+  const ct = contactOf(ar[0].inv.bizNo, ar[0].inv.name) || {}; const s = DB.settings;
+  const lines = ar.map(x => `- ${x.inv.date} ${x.inv.item} : ${won(x.inv.total)}원`).join('\n');
+  const body = `${ct.person ? ct.person + ' ' + (ct.title || '') + '님' : '담당자님'}\n\n안녕하세요. ${s.company || '이포트텍'} ${s.owner || ''}입니다.\n아래 세금계산서 대금이 아직 확인되지 않아 연락드립니다.\n\n${lines}\n합계 ${won(ar.reduce((a, x) => a + x.inv.total, 0))}원 (부가세 포함)\n\n이미 처리하셨다면 양해 부탁드리며, 지급 예정일을 알려주시면 감사하겠습니다.\n\n${s.owner || ''} 드림\n${s.tel || ''}`;
+  DB.dunning = DB.dunning || {}; DB.dunning[key] = todayStr(); await save();
+  location.href = `mailto:${encodeURIComponent(ct.email || '')}?subject=${encodeURIComponent(`[${s.company || '이포트텍'}] 세금계산서 대금 확인 요청`)}&body=${encodeURIComponent(body)}`;
+  if (!ct.email) toast('거래처 이메일이 없습니다. 거래처 화면에서 넣어 두면 다음부터 자동으로 들어갑니다');
+}
+
+/* ---------------- 사이트 탭: 사이트 · 거래처 · 수익 ---------------- */
+function sitesSeg(on) { return `<div class="seg"><a href="#sites" class="${on === 'sites' ? 'on' : ''}">사이트</a><a href="#clients" class="${on === 'clients' ? 'on' : ''}">거래처</a><a href="#profit" class="${on === 'profit' ? 'on' : ''}">사이트별 수익</a></div>`; }
+function siteProfit(s, yr) {
+  const c = calc(), inYr = d => !yr || d.startsWith(yr);
+  const sales = (c.bySite[s.id] || []).filter(i => inYr(i.date) && !c.cancelled.has(i.id)).reduce((a, i) => a + i.supply, 0);
+  const buy = (c.costBySite[s.id] || []).filter(i => inYr(i.date)).reduce((a, i) => a + i.supply, 0);
+  const parts = DB.events.filter(e => e.siteId === s.id && e.partId && inYr(e.date)).reduce((a, e) => a + ((DB.parts.find(p => p.id === e.partId) || {}).cost || 0) * (e.partQty || 0), 0);
+  return { sales, buy, parts, cost: buy + parts, profit: sales - buy - parts };
+}
+let profYr = null;
+function viewProfit() {
+  const years = [...new Set(DB.invoices.map(i => i.date.slice(0, 4)))].sort().reverse(); const yr = profYr || todayStr().slice(0, 4);
+  const l = DB.sites.map(s => ({ s, ...siteProfit(s, yr === '전체' ? '' : yr) })).filter(x => x.sales || x.cost).sort((a, b) => b.profit - a.profit);
+  const tot = l.reduce((a, x) => ({ sales: a.sales + x.sales, cost: a.cost + x.cost }), { sales: 0, cost: 0 });
+  const unl = DB.invoices.filter(i => i.kind === '매입' && !i.siteId && (yr === '전체' || i.date.startsWith(yr))).sort((a, b) => b.date.localeCompare(a.date));
+  return sitesSeg('profit') + `<div class="toolbar"><select onchange="profYr=this.value;render()">${['전체', ...years].map(y => `<option ${y === yr ? 'selected' : ''}>${y}</option>`).join('')}</select></div>
+  <div class="card"><h3>${yr === '전체' ? '전체 기간' : yr + '년'} 사이트 ${l.length}곳</h3><div class="kv"><div>매출</div><div><b>${won(tot.sales)}</b>원</div><div>원가 (연결된 매입+부품)</div><div>${won(tot.cost)}원</div><div>이익</div><div class="grn"><b>${won(tot.sales - tot.cost)}</b>원</div></div></div>
+  <div class="card plt"><div class="plh"><span>사이트</span><span>매출</span><span>원가</span><span>이익</span></div>
+  ${l.map(x => `<div class="plr" onclick="go('#site/${x.s.id}')"><span>${esc(x.s.name)}${x.s.old ? ' <small class="sub">old</small>' : ''}</span><span>${won(x.sales)}</span><span>${x.cost ? won(x.cost) : '-'}</span><span class="${x.profit < 0 ? 'red' : ''}">${won(x.profit)}<small>${x.sales ? Math.round(x.profit / x.sales * 100) + '%' : ''}</small></span></div>`).join('')}</div>
+  <div class="card"><h3>사이트에 연결 안 된 매입 ${unl.length}건 <span class="sub" style="font-size:12px;font-weight:400">${won(unl.reduce((a, i) => a + i.supply, 0))}원</span></h3>
+  ${unl.slice(0, 40).map(i => row(esc(i.name), `${i.date} · ${esc(i.item)}`, won(i.supply), `onclick="invDetail('${i.id}')"`)).join('') || '<div class="empty">없음</div>'}
+  <div class="note">부품·장비 매입 계산서를 눌러 사이트를 고르면 그 사이트 원가로 잡혀 이익이 계산됩니다. 작업 기록에 쓴 재고 부품도 구매 단가만큼 원가에 들어갑니다.</div></div>`;
+}
+
+/* ---------------- 거래처 주소록 ---------------- */
+let cliQ = '';
+function clientRows() {
+  const m = {}; const yr = todayStr().slice(0, 4); const arL = receivables();
+  for (const i of DB.invoices) { const k = i.bizNo || i.name; const x = m[k] = m[k] || { k, bizNo: i.bizNo, name: i.name, sales: 0, buy: 0, n: 0, last: '', ar: 0 }; x.n++; if (i.date >= x.last) { x.last = i.date; x.name = i.name; } if (i.date.startsWith(yr)) { if (i.kind === '매출') x.sales += i.supply; else x.buy += i.supply; } }
+  for (const x of arL) { const k = x.inv.bizNo || x.inv.name; if (m[k]) m[k].ar += x.inv.total; }
+  for (const ct of DB.contacts || []) { const k = ct.bizNo || ct.name; m[k] = Object.assign(m[k] || { k, bizNo: ct.bizNo, name: ct.name, sales: 0, buy: 0, n: 0, last: '', ar: 0 }, { ct }); }
+  return Object.values(m);
+}
+function viewClients() {
+  const q = cliQ.toLowerCase();
+  const l = clientRows().filter(x => !q || (x.name + x.bizNo + (x.ct ? x.ct.person + x.ct.email + x.ct.phone : '')).toLowerCase().includes(q)).sort((a, b) => !!b.ct - !!a.ct || (b.sales + b.buy) - (a.sales + a.buy) || b.last.localeCompare(a.last));
+  return sitesSeg('clients') + `<div class="toolbar"><input placeholder="거래처·담당자·사업자번호 검색" value="${esc(cliQ)}" oninput="cliQ=this.value;render(true)"><button class="btn" onclick="contactForm({})">+ 거래처</button></div>
+  <div class="card"><h3>거래처 ${l.length}곳 <span class="sub" style="font-size:12px;font-weight:400">담당자 등록 ${l.filter(x => x.ct).length}</span></h3>
+  ${l.slice(0, 150).map(x => row(`${esc(x.name)} ${x.ct && x.ct.person ? `<span class="badge blue">${esc(x.ct.person)}</span>` : ''}${x.ar ? ' <span class="badge red">미수</span>' : ''}`, `${esc(x.bizNo || '')} · ${x.n}건 · 최근 ${x.last || '-'}${x.ct && x.ct.email ? ' · ' + esc(x.ct.email) : ''}`, x.sales ? won(x.sales) : x.buy ? `<span class="sub">매입 ${won(x.buy)}</span>` : '', `onclick="go('#client/${encodeURIComponent(x.k)}')"`)).join('')}
+  ${l.length > 150 ? '<div class="empty">앞 150곳만 보입니다. 검색으로 좁혀 보세요.</div>' : ''}</div>
+  <div class="note">계산서에 나온 거래처가 자동으로 나옵니다. 눌러서 담당자·메일·계산서 수신 메일을 넣어 두면 발행 준비와 입금 요청 메일에 자동으로 쓰입니다. 금액은 올해 공급가액.</div>`;
+}
+function viewClient(k) {
+  const x = clientRows().find(r => r.k === k) || { k, bizNo: /^\d{3}-\d{2}-\d{5}$/.test(k) ? k : '', name: k, n: 0 };
+  const ct = x.ct || {}; const invs = DB.invoices.filter(i => (i.bizNo || i.name) === k).sort((a, b) => b.date.localeCompare(a.date));
+  const ar = receivables().filter(r => (r.inv.bizNo || r.inv.name) === k); const sites = DB.sites.filter(s => s.bizNo && s.bizNo === x.bizNo);
+  const byY = {}; for (const i of invs) { const y = i.date.slice(0, 4); byY[y] = byY[y] || { s: 0, p: 0 }; if (i.kind === '매출') byY[y].s += i.supply; else byY[y].p += i.supply; }
+  return `<div class="btns"><a class="btn ghost sm" href="#clients">← 거래처</a></div>
+  <div class="card"><h3>${esc(ct.name || x.name)} <a href="javascript:contactForm(${esc(JSON.stringify({ k, bizNo: x.bizNo, name: x.name }))})">${x.ct ? '수정' : '담당자 넣기'}</a></h3>
+  <div class="kv"><div>사업자번호</div><div>${esc(x.bizNo || '-')}</div>
+  <div>담당자</div><div>${esc([ct.person, ct.title].filter(Boolean).join(' ') || '-')}</div>
+  <div>전화</div><div>${ct.phone ? `<a href="tel:${esc(ct.phone)}">${esc(ct.phone)}</a>` : '-'}</div>
+  <div>이메일</div><div>${ct.email ? `<a href="mailto:${esc(ct.email)}">${esc(ct.email)}</a>` : '-'}</div>
+  <div>계산서 수신</div><div>${esc(ct.taxEmail || '-')}</div>
+  <div>메모</div><div>${esc(ct.note || '-')}</div>
+  <div>미수금</div><div class="${ar.length ? 'red' : ''}">${won(ar.reduce((a, r) => a + r.inv.total, 0))}원 (${ar.length}건)</div>
+  ${sites.length ? `<div>사이트</div><div>${sites.map(s => `<a href="#site/${s.id}">${esc(s.name)}</a>`).join(', ')}</div>` : ''}</div>
+  <div class="btns">${ar.length ? `<button class="btn" onclick="dunMail('${esc(k)}')">입금 요청 메일</button>` : ''}<button class="btn ghost" onclick="billPrep({});setTimeout(()=>{const f=$('#fm').elements;f.name.value=${esc(JSON.stringify(x.name))};f.bizNo.value=${esc(JSON.stringify(x.bizNo || ''))};},0)">계산서 발행 준비</button></div></div>
+  <div class="card"><h3>연도별 거래</h3>${Object.keys(byY).sort().reverse().map(y => row(y + '년', '', `매출 ${won(byY[y].s)}${byY[y].p ? `<br><small class="sub">매입 ${won(byY[y].p)}</small>` : ''}`)).join('') || '<div class="empty">계산서 없음</div>'}</div>
+  <div class="card"><h3>최근 계산서 ${invs.length}건</h3>${invs.slice(0, 30).map(i => row(esc(i.item), `${i.date} · ${i.kind}`, won(i.supply), `onclick="invDetail('${i.id}')"`)).join('') || '<div class="empty">없음</div>'}</div>`;
+}
+function contactForm(p) {
+  DB.contacts = DB.contacts || []; const ex = DB.contacts.find(c => (p.bizNo && c.bizNo === p.bizNo) || (!p.bizNo && p.name && c.name === p.name)) || null;
+  const c = ex || { name: p.name || '', bizNo: p.bizNo || '' };
+  formSheet(ex ? '거래처 수정' : '거래처 담당자 넣기', [
+    { k: 'name', label: '회사명', value: c.name }, { k: 'bizNo', label: '사업자번호', value: c.bizNo, ph: '000-00-00000' },
+    { k: 'person', label: '담당자', value: c.person, ph: '예: 김영규' }, { k: 'title', label: '직함', value: c.title, ph: '예: 전무' },
+    { k: 'phone', label: '전화', type: 'tel', value: c.phone }, { k: 'email', label: '이메일', type: 'email', value: c.email },
+    { k: 'taxEmail', label: '계산서 수신 메일', type: 'email', value: c.taxEmail }, { k: 'note', label: '메모', type: 'textarea', value: c.note },
+  ], o => { if (!o.name) { toast('회사명을 입력하세요'); return false; } if (ex) Object.assign(ex, o); else DB.contacts.push({ id: uid('c'), ...o }); toast('저장했습니다'); },
+    ex ? `<button class="btn red" type="button" onclick="delContact('${ex.id}')">삭제</button>` : '');
+}
+async function delContact(id) { if (!confirm('담당자 정보를 지울까요? (계산서는 그대로)')) return; DB.contacts = DB.contacts.filter(x => x.id !== id); closeSheet(); await save(); render(); }
+
+/* ---------------- 장비 대장 ---------------- */
+const allAssets = () => DB.sites.flatMap(s => (s.assets || []).map(a => ({ site: s, a })));
+const assetById = id => (allAssets().find(x => x.a.id === id) || {}).a || null;
+const assetLabel = a => [a.maker, a.model].filter(Boolean).join(' ') + (a.serial ? ` (${a.serial})` : '');
+function warrantySoon() { const lim = (() => { const d = new Date(); d.setDate(d.getDate() + 60); return d.toISOString().slice(0, 10); })(); return allAssets().filter(x => x.a.warrantyEnd && x.a.warrantyEnd <= lim && x.site.active !== false && !x.site.old); }
+function warrantyCard() { const l = warrantySoon(); return l.length ? `<div class="card" style="margin-top:12px"><h3>장비 보증·EOS 만료 ${l.length}대</h3>${l.map(x => row(esc(assetLabel(x.a)), esc(x.site.name), `<span class="badge ${x.a.warrantyEnd < todayStr() ? 'red' : 'org'}">${x.a.warrantyEnd}</span>`, `onclick="go('#site/${x.site.id}')"`)).join('')}</div>` : ''; }
+function assetCard(s) {
+  const l = s.assets || [];
+  return `<div class="card"><h3>장비 대장 ${l.length}대 <a href="javascript:assetForm('${s.id}')">+ 장비</a></h3>
+  ${l.map(a => { const n = DB.events.filter(e => e.assetId === a.id).length; return row(`${esc(assetLabel(a))}${a.warrantyEnd ? ` <span class="badge ${a.warrantyEnd < todayStr() ? 'red' : a.warrantyEnd <= ymAdd(ymOf(todayStr()), 2) + '-31' ? 'org' : ''}">보증 ${a.warrantyEnd}</span>` : ''}`, `${esc(a.kind || '')}${a.location ? ' · ' + esc(a.location) : ''}${n ? ' · 작업 ' + n + '건' : ''}${a.note ? ' · ' + esc(a.note) : ''}`, '', `onclick="assetForm('${s.id}','${a.id}')"`); }).join('') || `<div class="empty">등록된 장비가 없습니다${s.equipment ? ' (메모: ' + esc(s.equipment) + ')' : ''}</div>`}</div>`;
+}
+function assetForm(siteId, id) {
+  const s = DB.sites.find(x => x.id === siteId); s.assets = s.assets || []; const a = id ? s.assets.find(x => x.id === id) : { kind: '스토리지' };
+  formSheet(id ? '장비 수정' : '장비 추가', [
+    { k: 'kind', label: '종류', type: 'select', options: ['스토리지', '서버', '스위치', '백업장비', '테이프', 'UPS', '기타'], value: a.kind },
+    { k: 'maker', label: '제조사', value: a.maker, ph: '예: HPE, Dell, IBM' }, { k: 'model', label: '모델', value: a.model, ph: '예: Nimble CS1000' },
+    { k: 'serial', label: '시리얼 번호', value: a.serial }, { k: 'location', label: '설치 위치', value: a.location, ph: '예: 본관 전산실 랙3' },
+    { k: 'installed', label: '도입일', type: 'date', value: a.installed }, { k: 'warrantyEnd', label: '보증·EOS 만료일', type: 'date', value: a.warrantyEnd },
+    { k: 'note', label: '메모 (펌웨어, IP, 구성 등)', type: 'textarea', value: a.note },
+  ], o => { if (!o.model && !o.serial) { toast('모델이나 시리얼을 입력하세요'); return false; } if (id) Object.assign(a, o); else s.assets.push({ id: uid('a'), ...o }); toast('저장했습니다'); },
+    id ? `<button class="btn red" type="button" onclick="delAsset('${siteId}','${id}')">삭제</button>` : '');
+  if (id) { const ev = DB.events.filter(e => e.assetId === id).sort((x, y) => y.date.localeCompare(x.date)); if (ev.length) $('#fm').insertAdjacentHTML('beforeend', `<h3 style="font-size:14px">이 장비 작업 이력</h3>${ev.map(e => `<div class="row"><div class="l"><small>${e.date} · ${esc(e.type)} · ${esc(e.title || '')}</small></div></div>`).join('')}`); }
+}
+async function delAsset(siteId, id) { if (!confirm('장비를 삭제할까요?')) return; const s = DB.sites.find(x => x.id === siteId); s.assets = s.assets.filter(x => x.id !== id); closeSheet(); await save(); render(); }
+// 수주한 유지보수 견적서 → 사이트 등록 내용 미리 채우기
+function siteFromQuote(q) {
+  const months = Number(((q.items.find(it => /\d/.test(it.period || '')) || {}).period || '').match(/\d+/) || 0) || 0;
+  const monthly = q.items.reduce((a, it) => a + (Number(it.unit) || 0) * (Number(it.qty) || 1), 0) || (months ? Math.round(quoteTotals(q).sup / months) : quoteTotals(q).sup);
+  const start = ymAdd(ymOf(q.date), 1), end = months ? ymAdd(start, months - 1) : '';
+  return { active: true, visitDay: 25, inspect: '방문', cycle: '매월', billMonths: [], inspectMonths: [], name: q.title.replace(/\s*\(?\d+\s*개월\)?\s*$/, '').trim(), client: q.to, bizNo: lookupBizNo(q.to), amount: monthly,
+    startMonth: start, endMonth: end, contract: `${start} ~ ${end}${months ? ` (${months}개월)` : ''} · 견적 ${q.no || ''}`, equipment: q.items.map(it => [it.maker, it.model, it.qty > 1 ? '×' + it.qty : ''].filter(Boolean).join(' ')).join(', '), contact: q.attn || '' };
+}
+
+/* ---------------- 캘린더 ---------------- */
+function calItems() {
+  const out = [], today = todayStr(), ym = ymOf(today);
+  for (const m of [ym, ymAdd(ym, 1), ymAdd(ym, 2)]) for (const x of inspectStatus(m)) if (!x.done) out.push({ key: `ins:${x.site.id}:${m}`, date: x.plan < today && m === ym ? today : x.plan, title: `[점검] ${x.site.name}`, desc: `${x.site.client} · ${x.site.inspect || '방문'}\n${x.site.equipment || ''}` });
+  for (const o of DB.orders || []) if (o.dueDate && o.dueDate >= today && ['접수', '진행'].includes(o.status)) out.push({ key: `ord:${o.id}`, date: o.dueDate, title: `[${o.kind}] ${o.title}`, desc: `${o.client || ''} ${o.customer || ''}\n${o.summary || ''}` });
+  for (const e of DB.events) if (e.date >= today) out.push({ key: `ev:${e.id}`, date: e.date, title: `[${e.type}] ${siteName(e.siteId)} ${e.title || ''}`.trim(), desc: e.memo || '' });
+  return out;
+}
+function downloadICS() {
+  const z = d => d.replace(/-/g, ''); const nx = d => { const t = new Date(d); t.setDate(t.getDate() + 1); return t.toISOString().slice(0, 10).replace(/-/g, ''); };
+  const e = s => String(s || '').replace(/([,;\\])/g, '\\$1').replace(/\n/g, '\\n');
+  const ics = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//eporttech-erp//KO', ...calItems().flatMap(x => ['BEGIN:VEVENT', `UID:${x.key.replace(/:/g, '-')}@eporttech-erp`, `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`, `DTSTART;VALUE=DATE:${z(x.date)}`, `DTEND;VALUE=DATE:${nx(x.date)}`, `SUMMARY:${e(x.title)}`, `DESCRIPTION:${e(x.desc)}`, 'END:VEVENT']), 'END:VCALENDAR'].join('\r\n');
+  download(`이포트텍_일정_${todayStr()}.ics`, ics, 'text/calendar'); toast('파일을 열면 캘린더에 추가됩니다');
+}
+
+/* ---------------- 입금 문자 붙여넣기 ---------------- */
+function parseBankText(text) {
+  const now = new Date(), Y = now.getFullYear(), out = [];
+  const skip = /web발신|은행|뱅크|bank|잔액|출금|계좌|^\s*\d{2,}[-*][\d*-]+\s*$|^[\d\s:./-]+$|입금$|^\s*$|님$|알림|^\[|\]$/i;
+  const blocks = String(text).replace(/\r/g, '').split(/\n\s*\n|(?=\[Web발신\])/i);
+  for (const b of blocks) {
+    const lines = b.split('\n').map(x => x.trim()).filter(Boolean); let date = '';
+    lines.forEach((ln, i) => {
+      const dm = ln.match(/(20\d\d)[.\-/년\s]+(\d{1,2})[.\-/월\s]+(\d{1,2})/) || ln.match(/(?:^|\D)(\d{1,2})[/.월]\s?(\d{1,2})(?:일)?(?:\s|$|\D)/);
+      if (dm) { date = dm.length === 4 ? `${dm[1]}-${dm[2].padStart(2, '0')}-${dm[3].padStart(2, '0')}` : `${Y}-${dm[1].padStart(2, '0')}-${dm[2].padStart(2, '0')}`; if (date > todayStr()) date = (Y - 1) + date.slice(4); }
+      const am = ln.match(/입금\s*:?\s*([\d,]{3,})\s*원?/) || ln.match(/([\d,]{3,})\s*원?\s*입금/);
+      if (!am) return; const amount = toNum(am[1]); if (!amount) return;
+      let name = ln.replace(am[0], '').replace(/(20\d\d)[.\-/년\s]+\d{1,2}[.\-/월\s]+\d{1,2}일?/, '').replace(/\d{1,2}[/.]\d{1,2}/, '').replace(/\d{1,2}:\d{2}(:\d{2})?/, '').replace(/잔액\s*[\d,]+원?/, '').replace(/[\d*]{2,}-[\d*-]+/, '').replace(/\[.*?\]/g, '').replace(/\s+/g, ' ').trim();
+      if (!name || skip.test(name) || /^[\d,\s원]+$/.test(name)) { const cand = [lines[i + 1], lines[i - 1], ...lines.slice(i + 2)].filter(Boolean).find(x => !skip.test(x) && !/[\d,]{4,}/.test(x) && !/\d{1,2}[/.]\d{1,2}/.test(x)); name = cand || ''; }
+      name = name.replace(/^(입금자|보낸분)\s*:?\s*/, '').replace(/^(IBK|KB|NH|SC|기업|국민|신한|우리|하나|농협|카카오뱅크|카카오|토스뱅크|토스|케이뱅크|씨티|새마을|우체국)(은행)?\s+/i, '').replace(/[()]$/, '').trim();
+      out.push({ date: date || todayStr(), name, amount });
+    });
+  }
+  return out;
+}
+let _smsRows = [];
+function smsSheet() {
+  openSheet(`<h2>입금 문자 붙여넣기</h2><p class="note">은행 입금 알림 문자(여러 개 가능)나 거래내역을 복사해 붙여넣으세요. 날짜·입금자·금액을 찾아 미리 보여 줍니다.</p>
+  <textarea id="smsTxt" style="width:100%;min-height:160px" placeholder="[Web발신]&#10;[기업은행] 11/25 14:30&#10;입금 1,320,000원&#10;씨큐아이&#10;잔액 12,345,678원"></textarea>
+  <div class="btns"><button class="btn" onclick="smsParse()">찾기</button><button class="btn ghost" onclick="closeSheet()">닫기</button></div><div id="smsOut"></div>`);
+}
+function smsParse() {
+  _smsRows = parseBankText($('#smsTxt').value);
+  $('#smsOut').innerHTML = _smsRows.length ? `<h3 style="font-size:14px">${_smsRows.length}건 찾음 (고칠 수 있음)</h3>${_smsRows.map((r, i) => `<div class="grid2" style="grid-template-columns:110px 1fr 110px;margin-bottom:6px"><input type="date" value="${r.date}" onchange="_smsRows[${i}].date=this.value"><input value="${esc(r.name)}" onchange="_smsRows[${i}].name=this.value" placeholder="입금자"><input inputmode="numeric" value="${won(r.amount)}" onchange="_smsRows[${i}].amount=toNum(this.value)"></div>`).join('')}<div class="btns"><button class="btn grn" onclick="smsSave()">입금 ${_smsRows.length}건 넣고 자동 대조</button></div>` : '<div class="empty">입금 금액을 찾지 못했습니다. “입금 1,000,000원”처럼 금액 앞뒤에 ‘입금’이 있어야 합니다.</div>';
+}
+async function smsSave() {
+  const news = []; for (const r of _smsRows) { if (!r.amount) continue; if (DB.deposits.some(d => d.date === r.date && d.amount === r.amount && d.name === r.name)) continue; const d = { id: uid('d'), date: r.date, name: r.name, amount: r.amount, memo: '입금 문자', invIds: [] }; DB.deposits.push(d); news.push(d); }
+  const n = autoMatch(news); closeSheet(); await save(); render(); toast(`입금 ${news.length}건 추가, 계산서와 ${n}건 자동 연결`);
+}
+
+/* ---------------- 변경 기록 ---------------- */
+const LOG_COLS = { sites: ['사이트', x => x.name], invoices: ['계산서', x => `${x.name} ${x.item} ${won(x.supply)}`], events: ['작업기록', x => `${siteName(x.siteId)} ${x.title || x.type}`], parts: ['부품', x => `${x.name} (${x.qty})`], deposits: ['입금', x => `${x.name} ${won(x.amount)}`], orders: ['발주', x => x.title], quotes: ['견적서', x => x.title], billReqs: ['발행요청', x => `${x.item} ${won(x.supply)} ${x.status}`], contacts: ['거래처', x => x.name] };
+let _snap = null;
+function snapOf() { const m = new Map(); for (const k in LOG_COLS) for (const x of DB[k] || []) m.set(k + ':' + x.id, JSON.stringify(x)); return m; }
+const deviceName = () => { const u = navigator.userAgent; return /iPhone|iPad/.test(u) ? 'iPhone' : /Android/.test(u) ? '안드로이드' : /Windows/.test(u) ? 'PC' : /Mac/.test(u) ? 'Mac' : '기기'; };
+function diffLog() {
+  if (!DB) return; if (!_snap) { _snap = snapOf(); return; }
+  const now = snapOf(), msgs = [], desc = (key, v) => { const k = key.slice(0, key.indexOf(':')); try { return LOG_COLS[k][1](JSON.parse(v)); } catch (e) { return ''; } };
+  for (const [key, v] of now) { const o = _snap.get(key); if (o === v) continue; msgs.push(`${LOG_COLS[key.slice(0, key.indexOf(':'))][0]} ${o ? '수정' : '추가'}: ${desc(key, v)}`); }
+  for (const [key, v] of _snap) if (!now.has(key)) msgs.push(`${LOG_COLS[key.slice(0, key.indexOf(':'))][0]} 삭제: ${desc(key, v)}`);
+  if (msgs.length) { DB.log = DB.log || []; DB.log.push({ t: new Date().toISOString(), dev: deviceName(), n: msgs.length, m: msgs.slice(0, 15) }); if (DB.log.length > 500) DB.log = DB.log.slice(-500); }
+  _snap = now;
+}
+function logCard() {
+  const l = (DB.log || []).slice(-40).reverse();
+  return `<details class="card"><summary><h3 style="display:inline">변경 기록 ${(DB.log || []).length}건</h3></summary>${l.map(x => `<div class="row"><div class="l"><b style="font-weight:400;font-size:13px">${x.m.map(esc).join('<br>')}${x.n > x.m.length ? `<br><small class="sub">외 ${x.n - x.m.length}건</small>` : ''}</b><small>${new Date(x.t).toLocaleString('ko-KR')} · ${esc(x.dev || '')}</small></div></div>`).join('') || '<div class="empty">기록 없음</div>'}</details>`;
+}
+
 /* ---------------- 라우터 ---------------- */
-const TITLES = { tech: '기술지원 (유지보수 외)', orders: '발주 · 견적', home: '이포트텍 ERP', schedule: '유지보수 일정', sites: '사이트', site: '사이트 상세', invoices: '세금계산서', ar: '미수금 · 입금', parts: '부품 재고', settings: '설정' };
+const TITLES = { clients: '거래처', client: '거래처', profit: '사이트별 수익', tech: '기술지원 (유지보수 외)', orders: '발주 · 견적', home: '이포트텍 ERP', schedule: '유지보수 일정', sites: '사이트', site: '사이트 상세', invoices: '세금계산서', ar: '미수금 · 입금', parts: '부품 재고', settings: '설정' };
 function go(h) { location.hash = h; }
 function render(keepFocus) {
   const [name, arg] = (location.hash.slice(1) || 'home').split('/');
   const focusId = keepFocus && document.activeElement && document.activeElement.tagName === 'INPUT' ? document.activeElement : null; const pos = focusId ? focusId.selectionStart : 0; const ph = focusId ? focusId.placeholder : '';
   let html = '';
+  if (autoReconcile()) { save(); }
   if (!DB.sites.length && !DB.invoices.length && name !== 'settings') html = `<div class="card"><h3>처음 시작하기</h3><p class="note">자료가 비어 있습니다. 함께 드린 <b>이포트텍_ERP_초기데이터.json</b> 파일을 불러오면 유지보수 사이트 18곳과 2020~2026 세금계산서가 바로 들어갑니다.</p><div class="btns"><button class="btn" onclick="importJSON()">초기 데이터 불러오기</button><button class="btn ghost" onclick="go('#settings')">구글 시트에서 받기</button></div></div>`;
-  else html = ({ home: viewHome, schedule: viewSchedule, sites: viewSites, site: () => viewSite(arg), invoices: () => viewInvoices(arg), ar: viewAR, parts: viewParts, tech: perCallView, settings: viewSettings, orders: viewOrders }[name] || viewHome)();
+  else html = ({ home: viewHome, schedule: viewSchedule, sites: viewSites, site: () => viewSite(arg), invoices: () => viewInvoices(arg), ar: viewAR, parts: viewParts, tech: perCallView, settings: viewSettings, orders: viewOrders, clients: viewClients, client: () => viewClient(decodeURIComponent(arg || '')), profit: viewProfit }[name] || viewHome)();
   $('#view').innerHTML = html; $('#pageTitle').textContent = TITLES[name] || TITLES.home;
-  const tab = name === 'site' ? 'sites' : name; document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.tab === tab));
+  const tab = ['site', 'clients', 'client', 'profit'].includes(name) ? 'sites' : name; document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.tab === tab));
   if (ph) { const el = [...document.querySelectorAll('#view input')].find(x => x.placeholder === ph); if (el) { el.focus(); el.setSelectionRange(pos, pos); } }
 }
 window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
 $('#btnSettings').onclick = () => go('#settings');
 (async () => {
   DB = (await IDB.get('db')) || blankDB();
-  DB = Object.assign(blankDB(), DB); DB.settings = Object.assign(blankDB().settings, DB.settings);
+  DB = Object.assign(blankDB(), DB); DB.settings = Object.assign(blankDB().settings, DB.settings); diffLog();
   render(); syncBadge();
   if (syncReady()) autoPull(); else if (DB.settings.syncUrl) pullInbox(true);
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
