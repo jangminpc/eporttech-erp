@@ -726,7 +726,7 @@ function orderForm(o) {
     { k: 'amount', label: '금액 (공급가액)', type: 'number', value: o.amount }, { k: 'dueDate', label: '납기·작업일', type: 'date', value: o.dueDate },
     { k: 'summary', label: '내용', type: 'textarea', value: o.summary }, { k: 'contact', label: '담당자', value: o.contact },
   ], v => { if (!v.title) { toast('건명을 입력하세요'); return false; } if (isNew) DB.orders.push({ id: uid('o'), source: 'manual', ...v }); else Object.assign(o, v); toast('저장했습니다'); },
-    (o.mailUrl ? `<a class="btn ghost" target="_blank" href="${esc(o.mailUrl)}">메일 보기</a>` : '') + (isNew ? '' : (o.kind === '견적요청' ? `<button class="btn grn" type="button" onclick="quoteFromOrder('${o.id}')">견적서 작성</button>` : '') + (o.kind === '발주' || o.kind === '장애·점검요청' ? `<button class="btn ghost" type="button" onclick="closeSheet();billPrep({orderId:'${o.id}'})">계산서 발행 준비</button>` : '') + `<button class="btn ghost" type="button" onclick="orderToEvent('${o.id}')">작업 기록으로</button><button class="btn red" type="button" onclick="delOrder('${o.id}')">삭제</button>`));
+    (o.mailUrl ? `<a class="btn ghost" target="_blank" href="${esc(o.mailUrl)}">메일 보기</a>` : '') + (isNew ? '' : (o.kind === '견적요청' ? `<button class="btn grn" type="button" onclick="quoteFromOrder('${o.id}')">견적서 작성</button>` : '') + (['발주', '장애·점검요청', '견적요청'].includes(o.kind) ? `<button class="btn ghost" type="button" onclick="closeSheet();billPrep({orderId:'${o.id}'})">계산서 발행 준비</button>` : '') + `<button class="btn ghost" type="button" onclick="orderToEvent('${o.id}')">작업 기록으로</button><button class="btn red" type="button" onclick="delOrder('${o.id}')">삭제</button>`));
 }
 async function delOrder(id) { if (!confirm('삭제할까요?')) return; DB.orders = DB.orders.filter(x => x.id !== id); closeSheet(); await save(); render(); }
 function orderToEvent(id) { const o = DB.orders.find(x => x.id === id); closeSheet(); eventForm({ siteId: o.siteId, date: todayStr(), type: o.kind === '장애·점검요청' ? '장애처리' : '기술지원', title: o.title, memo: o.summary }); }
@@ -795,8 +795,8 @@ function viewQuotes() {
   const list = (DB.quotes || []).slice().sort((a, b) => b.date.localeCompare(a.date) || (b.no || '').localeCompare(a.no || ''));
   return `<div class="btns"><button class="btn" onclick="quoteEdit()">+ 새 견적서</button></div>
   <div class="card"><h3>견적서 ${list.length}건 <span class="sub" style="font-size:12px;font-weight:400">수주 ${won(list.filter(q => q.status === '수주').reduce((a, q) => a + quoteTotals(q).sup, 0))}원</span></h3>
-  ${list.map(q => row(`${esc(q.title || '(건명 없음)')} <span class="badge ${q.status === '수주' ? 'grn' : q.status === '발송' ? 'blue' : q.status === '실주' ? '' : 'org'}">${esc(q.status)}</span>`, `${q.date} · ${esc(q.to)}${q.no ? ' · ' + esc(q.no) : ''}`, won(quoteTotals(q).sup), `onclick="quoteEdit('${q.id}')"`)).join('') || '<div class="empty">아직 견적서가 없습니다</div>'}</div>
-  <div class="note">견적서를 작성하고 “PDF 저장/인쇄”를 누르면 이포트텍 양식으로 출력됩니다. 인쇄 창에서 대상을 “PDF로 저장”으로 고르면 파일이 됩니다.</div>`;
+  ${list.map(q => row(`${esc(q.title || '(건명 없음)')} <span class="badge ${q.status === '수주' ? 'grn' : q.status === '발송' ? 'blue' : q.status === '실주' ? '' : 'org'}">${esc(q.status)}</span>${q.invId ? ' <span class="badge grn">계산서</span>' : pendingReqs().some(r => r.quoteId === q.id) ? ' <span class="badge blue">발행요청</span>' : ''}`, `${q.date} · ${esc(q.to)}${q.no ? ' · ' + esc(q.no) : ''}`, won(quoteTotals(q).sup), `onclick="quoteEdit('${q.id}')"`)).join('') || '<div class="empty">아직 견적서가 없습니다</div>'}</div>
+  <div class="note">발주서 없이 진행하는 건은 견적서를 열어 <b>계산서 발행 준비</b>를 누르면 견적 금액·건명으로 바로 발행요청이 만들어집니다(견적은 수주로 바뀜). 견적서를 작성하고 “PDF 저장/인쇄”를 누르면 이포트텍 양식으로 출력됩니다. 인쇄 창에서 대상을 “PDF로 저장”으로 고르면 파일이 됩니다.</div>`;
 }
 let QD = null; // 편집 중인 견적서
 function quoteEdit(id, preset) {
@@ -822,7 +822,7 @@ function renderQuoteSheet() {
   <div class="btns"><button class="btn sm ghost" type="button" onclick="quoteItem(-1,1)">+ 품목 추가</button></div>
   <div class="kv" style="margin:8px 0"><div>공급가액</div><div><b id="qSup">${won(t.sup)}</b>원</div><div>부가세</div><div id="qVat">${won(t.vat)}원</div><div>합계</div><div id="qTot">${won(t.tot)}원</div></div>
   <label class="f">견적 조건 <span style="float:right">${Object.keys(QUOTE_TEMPLATES).map(k => `<a href="javascript:quoteTpl('${k}')" style="margin-left:8px">${k}</a>`).join('')}</span><textarea data-q="conditions" style="min-height:140px">${esc(q.conditions)}</textarea></label>
-  <div class="btns"><button class="btn" onclick="quoteSave()">저장</button><button class="btn grn" onclick="quoteSave(true)">PDF 저장/인쇄</button>${q.id ? `<button class="btn ghost" onclick="quoteMail()">메일 쓰기</button><button class="btn ghost" onclick="quoteCopy()">복사해서 새로</button>${q.status === '수주' ? '' : `<button class="btn ghost" onclick="quoteWon()">수주 처리</button>`}<button class="btn red" onclick="quoteDel()">삭제</button>` : ''}<button class="btn ghost" onclick="closeSheet()">닫기</button></div>`);
+  <div class="btns"><button class="btn" onclick="quoteSave()">저장</button><button class="btn grn" onclick="quoteSave(true)">PDF 저장/인쇄</button>${q.id ? `<button class="btn ghost" onclick="quoteMail()">메일 쓰기</button><button class="btn ghost" onclick="quoteCopy()">복사해서 새로</button>${q.status === '수주' ? '' : `<button class="btn ghost" onclick="quoteWon()">수주 처리</button>`}${q.invId ? '' : `<button class="btn grn" onclick="closeSheet();billPrep({quoteId:'${q.id}'})">계산서 발행 준비</button>`}<button class="btn red" onclick="quoteDel()">삭제</button>` : ''}<button class="btn ghost" onclick="closeSheet()">닫기</button></div>`);
   document.querySelectorAll('#sheet [data-q]').forEach(el => el.oninput = el.onchange = () => { QD[el.dataset.q] = el.type === 'number' ? Number(el.value) : el.value; });
   document.querySelectorAll('#sheet [data-i]').forEach(el => el.oninput = () => {
     const it = QD.items[el.dataset.i], k = el.dataset.k;
@@ -927,7 +927,9 @@ function billPrep(p) {
   if (isNew) {
     r = { date: todayStr(), bizNo: '', name: '', item: '', supply: 0, memo: '', recv: '청구' };
     if (p.siteId) { const s = DB.sites.find(x => x.id === p.siteId); const ym = p.ym || ymOf(todayStr()); Object.assign(r, { siteId: s.id, ym, bizNo: s.bizNo || lookupBizNo(s.client), name: s.client, item: isAdhoc(s) ? `${s.name} 기술지원` : billItemFor(s, ym), supply: s.amount || 0 }); }
-    if (p.orderId) { const o = DB.orders.find(x => x.id === p.orderId); Object.assign(r, { orderId: o.id, siteId: o.siteId || '', name: o.client || '', bizNo: lookupBizNo(o.client), item: o.title || '', supply: o.amount || 0 }); }
+    if (p.orderId) { const o = DB.orders.find(x => x.id === p.orderId); const q = (DB.quotes || []).find(x => x.orderId === o.id || x.id === o.quoteId);
+      Object.assign(r, { orderId: o.id, quoteId: q ? q.id : '', siteId: o.siteId || '', name: o.client || (q ? q.to : ''), bizNo: lookupBizNo(o.client || (q ? q.to : '')), item: o.title || (q ? q.title : ''), supply: o.amount || (q ? quoteTotals(q).sup : 0) }); }
+    if (p.quoteId) { const q = DB.quotes.find(x => x.id === p.quoteId); Object.assign(r, { quoteId: q.id, orderId: q.orderId || '', name: q.to || '', bizNo: lookupBizNo(q.to), item: q.title || '', supply: quoteTotals(q).sup }); }
     const ct = contactOf(r.bizNo, r.name); if (ct && ct.taxEmail) r.memo = '수신 ' + ct.taxEmail;
   }
   formSheet(isNew ? '계산서 발행 준비' : '발행요청 수정', [
@@ -944,7 +946,10 @@ function billPrep(p) {
     if (!o.bizNo) o.bizNo = lookupBizNo(o.name);
     if (!/^\d{3}-?\d{2}-?\d{5}$/.test(o.bizNo || '')) { toast('사업자번호를 확인하세요 (000-00-00000)'); return false; }
     o.bizNo = o.bizNo.replace(/^(\d{3})-?(\d{2})-?(\d{5})$/, '$1-$2-$3'); o.tax = Math.round(o.supply * 0.1); o.total = o.supply + o.tax;
-    if (isNew) DB.billReqs.push({ id: uid('r'), status: '요청', created: new Date().toISOString(), siteId: r.siteId || '', ym: r.ym || '', orderId: r.orderId || '', ...o });
+    if (isNew) DB.billReqs.push({ id: uid('r'), status: '요청', created: new Date().toISOString(), siteId: r.siteId || '', ym: r.ym || '', orderId: r.orderId || '', quoteId: r.quoteId || '', ...o });
+    // 견적 → 바로 계산서: 발주 없이 진행하는 건은 견적을 수주로, 연결된 요청은 완료로
+    const q = r.quoteId && DB.quotes.find(x => x.id === r.quoteId); if (q && ['작성', '발송'].includes(q.status)) q.status = '수주';
+    const od = r.orderId && DB.orders.find(x => x.id === r.orderId); if (od && ['접수', '진행'].includes(od.status)) od.status = '완료';
     else Object.assign(r, o);
     toast('발행요청에 넣었습니다. 클로드에게 “발행요청 처리”라고 하면 홈택스에 채워 둡니다');
   }, `<button class="btn ghost" type="button" onclick="reqCopyForm()">글로 복사</button>${isNew ? '' : `<button class="btn red" type="button" onclick="reqCancel('${r.id}')">요청 취소</button>`}`);
@@ -977,7 +982,8 @@ function reconcileBillReqs() {
     const inv = cands.find(i => i.item.replace(/\s/g, '') === String(r.item).replace(/\s/g, '')) || (cands.length === 1 ? cands[0] : null);
     if (inv) { r.status = '발행'; r.invId = inv.id; r.doneAt = new Date().toISOString(); used.add(inv.id); n++;
       if (r.siteId && !inv.siteId) { const s = siteForInvoice(inv); if (!s || s.id !== r.siteId) inv.siteId = r.siteId; }
-      if (r.orderId) { const o = DB.orders.find(x => x.id === r.orderId); if (o && o.status !== '취소') o.status = '계산서발행'; } }
+      if (r.orderId) { const o = DB.orders.find(x => x.id === r.orderId); if (o && o.status !== '취소') o.status = '계산서발행'; }
+      if (r.quoteId) { const q = DB.quotes.find(x => x.id === r.quoteId); if (q) { q.status = '수주'; q.invId = inv.id; } } }
   }
   if (n) invalidate(); return n;
 }
