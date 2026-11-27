@@ -88,3 +88,5 @@ label.f>input,label.f>select,label.f>textarea{margin-top:4px;color:var(--txt)}
 .plr small{display:block;color:var(--sub);font-size:11px}
 .plr i{display:block;height:3px;border-radius:2px;margin-left:auto;margin-top:2px}
 .plr i.bs{background:var(--pri)}.plr i.bp{background:#e0a050}
+.today{border-left:4px solid var(--pri)}
+.today .row b{font-weight:600}
